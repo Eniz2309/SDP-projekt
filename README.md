@@ -29,13 +29,17 @@ i autobusni) te centralni server koji će sumirati sve prikupljene informacije s
 
 • korisnici prije korištanja usluge mogu registrovati proizvoljan broj grupa s tim da jedan učesnik može
 pripadati više grupa
+
 – za svaku grupu je neophodno odabrati voditelja grupa
 – voditelj grupe ima pravo odstraniti članove grupe po volji
 – učesnik može zahtjevati brisanje korisničkog naloga koje mora odobriti administrator
+
 • potrebno je uspostaviti sistem naplate za svaku od dostupnih vrsta javnog prevoza (npr. vremenska
 individualna karta za tramvajski saobraćaj = 1KM, dužinska indidivdualna karta za trolejbuski saobraćaj
 (2 stanice) = 0.5KM i sl. )
+
 • uspostaviti sistem popust usluga zasnovanog na posebnim terminima. Npr. popusti od 30% za usluge prevoza u vrijeme zagušenja cestovnog saobraćaja. popusti od 10% za odabranu grupu korisnika (penzioneri
 ili studenti).
+
 • uspostavisti regionalni sistem koji obuhvata najmanje dva odvojena servera te implementirati komunikaciju
 server-server.
