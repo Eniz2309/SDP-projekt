@@ -2,9 +2,6 @@
 Repozitorij za projekt iz predmeta Softverski Dizajn Protokola - protokol za upravljanje sistemom autonomnih dronova
 
 
-
-# Autonomous Drone Control Protocol
-
 Projekat predstavlja implementaciju protokola za upravljanje autonomnim dronovima. Sistem se sastoji od centralnog servera, regionalnih servera i klijentskih aplikacija dronova.
 
 ## Struktura projekta
