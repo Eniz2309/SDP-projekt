@@ -7,17 +7,17 @@ Ova verzija dodaje formacijski let kroz multicast poruku sa regionalnog servera 
 Ako je `include` folder u istom direktoriju kao cpp fajlovi:
 
 ```bash
-g++ -std=c++11 -I include central_server_formation.cpp -o central_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I include regional_server_formation.cpp -o regional_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I include drone_client_formation.cpp -o drone_client -lboost_system -pthread
+g++ -std=c++11 -I include central_server.cpp -o central_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I include regional_server.cpp -o regional_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I include drone_client.cpp -o drone_client -lboost_system -pthread
 ```
 
 Ako je `include` folder jedan nivo iznad:
 
 ```bash
-g++ -std=c++11 -I ../include central_server_formation.cpp -o central_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I ../include regional_server_formation.cpp -o regional_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I ../include drone_client_formation.cpp -o drone_client -lboost_system -pthread
+g++ -std=c++11 -I ../include central_server.cpp -o central_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I ../include regional_server.cpp -o regional_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I ../include drone_client.cpp -o drone_client -lboost_system -pthread
 ```
 
 ## Pokretanje
