@@ -1,3 +1,12 @@
+// drone_client.cpp
+// Klijent drona.
+// Funkcionalnosti:
+// - registracija i autentifikacija
+// - keepalive i telemetrija
+// - misije: TEST_FLIGHT, MONITORING, DELIVERY
+// - DELIVERY: kretanje po kockastoj konturi do izlazne tačke, pa prilaz dostavnoj tački pod 90°
+// - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
+
 #include <boost/asio.hpp>
 #include <iostream>
 #include <string>
@@ -6,6 +15,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+
 #include "json/json.h"
 
 using boost::asio::ip::tcp;
@@ -28,12 +38,15 @@ public:
                 const std::string& zone,
                 const std::string& mission_type,
                 const std::string& route_id,
-                int base_altitude)
+                int base_altitude,
+                double delivery_lat,
+                double delivery_lon)
         : io_(io),
           socket_(io),
           resolver_(io),
           keepalive_timer_(io),
           telemetry_timer_(io),
+          battery_timer_(io),
           host_(host),
           port_(port),
           drone_uri_(drone_uri),
@@ -42,14 +55,20 @@ public:
           mission_type_(mission_type),
           route_id_(route_id),
           mission_id_(drone_uri + "_M001"),
-          battery_(90),
+          delivery_lat_(delivery_lat),
+          delivery_lon_(delivery_lon),
+          battery_(100),
           lat_(43.8563),
           lon_(18.4131),
           altitude_(base_altitude),
           speed_(10),
           direction_("NORTH"),
           status_("INIT"),
-          current_waypoint_(0)
+          current_waypoint_(0),
+          delivery_mode_(false),
+          reached_exit_point_(false),
+          package_delivered_(false),
+          mission_finished_sent_(false)
     {
     }
 
@@ -63,12 +82,14 @@ public:
                 if (!ec)
                 {
                     std::cout << "[DRONE] Connected to regional server.\n";
+
                     start_read();
                     send_register();
                 }
                 else
                 {
-                    std::cerr << "[DRONE] Connection error: " << ec.message() << std::endl;
+                    std::cerr << "[DRONE] Connection error: "
+                              << ec.message() << std::endl;
                 }
             });
     }
@@ -83,6 +104,8 @@ private:
         msg["BATTERY"] = battery_;
         msg["LAT"] = lat_;
         msg["LON"] = lon_;
+        msg["ALTITUDE"] = altitude_;
+
         send_json(msg);
     }
 
@@ -92,35 +115,23 @@ private:
         msg["TYPE"] = "AUTH_REQ";
         msg["DRONE_URI"] = drone_uri_;
         msg["TOKEN"] = token_;
-        send_json(msg);
-    }
 
-    void send_mission_request()
-    {
-        json msg;
-        msg["TYPE"] = "MISSION_REQUEST";
-        msg["MISSION_ID"] = mission_id_;
-        msg["MISSION_TYPE"] = mission_type_;
-        msg["DRONE_URI"] = drone_uri_;
-        msg["ZONE"] = zone_;
-        msg["ROUTE_ID"] = route_id_;
-        msg["ALTITUDE"] = altitude_;
         send_json(msg);
-
-        std::cout << "[DRONE] Mission request sent: " << zone_ << " / " << route_id_ << std::endl;
     }
 
     void start_keepalive()
     {
         keepalive_timer_.expires_after(std::chrono::seconds(15));
-        keepalive_timer_.async_wait([this](boost::system::error_code ec)
-        {
-            if (!ec)
+
+        keepalive_timer_.async_wait(
+            [this](boost::system::error_code ec)
             {
-                send_keepalive();
-                start_keepalive();
-            }
-        });
+                if (!ec)
+                {
+                    send_keepalive();
+                    start_keepalive();
+                }
+            });
     }
 
     void send_keepalive()
@@ -132,21 +143,29 @@ private:
         msg["STATUS"] = status_;
         msg["LAT"] = lat_;
         msg["LON"] = lon_;
+        msg["ALTITUDE"] = altitude_;
+        msg["ROUTE_ID"] = active_route_id_;
+
         send_json(msg);
+
+        std::cout << "[DRONE] KEEPALIVE sent. Battery="
+                  << battery_ << "%\n";
     }
 
     void start_telemetry()
     {
         telemetry_timer_.expires_after(std::chrono::seconds(3));
-        telemetry_timer_.async_wait([this](boost::system::error_code ec)
-        {
-            if (!ec)
+
+        telemetry_timer_.async_wait(
+            [this](boost::system::error_code ec)
             {
-                update_simulated_position();
-                send_telemetry();
-                start_telemetry();
-            }
-        });
+                if (!ec)
+                {
+                    update_simulated_values();
+                    send_telemetry();
+                    start_telemetry();
+                }
+            });
     }
 
     void send_telemetry()
@@ -162,58 +181,44 @@ private:
         msg["SPEED"] = speed_;
         msg["DIRECTION"] = direction_;
         msg["ROUTE_ID"] = active_route_id_;
+
         send_json(msg);
 
-        std::cout << "[DRONE] TELEMETRY | " << status_
+        std::cout << "[DRONE] TELEMETRY | "
+                  << status_
                   << " | lat=" << lat_
                   << " lon=" << lon_
                   << " alt=" << altitude_
                   << " route=" << active_route_id_
+                  << " battery=" << battery_ << "%"
                   << std::endl;
     }
 
-    void update_simulated_position()
+    void start_battery_timer()
     {
-        if (status_ == "ON_MISSION" && !route_points_.empty())
-        {
-            GeoPoint p = route_points_[current_waypoint_];
-            lat_ = p.lat;
-            lon_ = p.lon;
+        battery_timer_.expires_after(std::chrono::seconds(120));
 
-            current_waypoint_++;
-
-            if (current_waypoint_ >= route_points_.size())
+        battery_timer_.async_wait(
+            [this](boost::system::error_code ec)
             {
-                current_waypoint_ = 0;
-
-                if (mission_type_ == "TEST_FLIGHT")
+                if (!ec)
                 {
-                    finish_mission();
+                    if (status_ != "IDLE" && status_ != "REGISTERED" && battery_ > 0)
+                    {
+                        battery_ -= 1;
+
+                        std::cout << "[DRONE] Battery decreased to "
+                                  << battery_ << "%\n";
+
+                        if (battery_ <= 20 && status_ != "RETURN_TO_BASE")
+                        {
+                            send_low_battery_alarm();
+                        }
+                    }
+
+                    start_battery_timer();
                 }
-            }
-
-            if (battery_ > 0) battery_ -= 1;
-        }
-
-        if (battery_ <= 20 && status_ != "RETURN_TO_BASE")
-        {
-            send_low_battery_alarm();
-        }
-    }
-
-    void finish_mission()
-    {
-        if (status_ != "ON_MISSION") return;
-
-        status_ = "IDLE";
-
-        json msg;
-        msg["TYPE"] = "MISSION_FINISHED";
-        msg["MISSION_ID"] = mission_id_;
-        msg["DRONE_URI"] = drone_uri_;
-        send_json(msg);
-
-        std::cout << "[DRONE] Mission finished: " << mission_id_ << std::endl;
+            });
     }
 
     void send_low_battery_alarm()
@@ -223,35 +228,192 @@ private:
         msg["DRONE_URI"] = drone_uri_;
         msg["ALARM_TYPE"] = "LOW_BATTERY";
         msg["MESSAGE"] = "Battery below 20 percent";
+
         send_json(msg);
+
+        std::cout << "[DRONE] LOW_BATTERY alarm sent.\n";
     }
 
-    GeoPoint offset_from_center(double center_lat, double center_lon, double north_m, double east_m)
+    void send_mission_request()
+    {
+        json msg;
+        msg["TYPE"] = "MISSION_REQUEST";
+        msg["MISSION_ID"] = mission_id_;
+        msg["MISSION_TYPE"] = mission_type_;
+        msg["DRONE_URI"] = drone_uri_;
+        msg["ZONE"] = zone_;
+        msg["ROUTE_ID"] = route_id_;
+        msg["ALTITUDE"] = altitude_;
+
+        if (mission_type_ == "DELIVERY")
+        {
+            msg["DELIVERY_LAT"] = delivery_lat_;
+            msg["DELIVERY_LON"] = delivery_lon_;
+        }
+
+        send_json(msg);
+
+        std::cout << "[DRONE] Mission request sent: "
+                  << mission_type_
+                  << " | zone=" << zone_
+                  << " | route=" << route_id_;
+
+        if (mission_type_ == "DELIVERY")
+        {
+            std::cout << " | delivery=" << delivery_lat_
+                      << "," << delivery_lon_;
+        }
+
+        std::cout << std::endl;
+    }
+
+    void finish_mission()
+    {
+        if (mission_finished_sent_)
+            return;
+
+        mission_finished_sent_ = true;
+        status_ = "IDLE";
+
+        json msg;
+        msg["TYPE"] = "MISSION_FINISHED";
+        msg["MISSION_ID"] = mission_id_;
+        msg["DRONE_URI"] = drone_uri_;
+
+        send_json(msg);
+
+        std::cout << "[DRONE] Mission finished: "
+                  << mission_id_ << std::endl;
+    }
+
+    GeoPoint offset_from_center(double center_lat, double center_lon,
+                                double north_m, double east_m)
     {
         const double PI = 3.14159265358979323846;
+
         double meters_per_deg_lat = 111320.0;
         double meters_per_deg_lon = 111320.0 * std::cos(center_lat * PI / 180.0);
 
         GeoPoint p;
         p.lat = center_lat + north_m / meters_per_deg_lat;
         p.lon = center_lon + east_m / meters_per_deg_lon;
+
         return p;
     }
 
-    std::vector<GeoPoint> generate_contour(double center_lat, double center_lon, double radius_m)
+    std::vector<GeoPoint> generate_square_contour(double center_lat,
+                                                  double center_lon,
+                                                  double half_size_m)
     {
-        const double PI = 3.14159265358979323846;
         std::vector<GeoPoint> points;
 
-        for (int angle = 0; angle < 360; angle += 45)
-        {
-            double rad = angle * PI / 180.0;
-            double north_m = radius_m * std::cos(rad);
-            double east_m = radius_m * std::sin(rad);
-            points.push_back(offset_from_center(center_lat, center_lon, north_m, east_m));
-        }
+        // Kontura je kvadrat/pravougaonik oko centra.
+        // Tačke idu redom: gore-lijevo, gore-desno, dolje-desno, dolje-lijevo, nazad gore-lijevo.
+        points.push_back(offset_from_center(center_lat, center_lon,  half_size_m, -half_size_m));
+        points.push_back(offset_from_center(center_lat, center_lon,  half_size_m,  half_size_m));
+        points.push_back(offset_from_center(center_lat, center_lon, -half_size_m,  half_size_m));
+        points.push_back(offset_from_center(center_lat, center_lon, -half_size_m, -half_size_m));
+        points.push_back(offset_from_center(center_lat, center_lon,  half_size_m, -half_size_m));
 
         return points;
+    }
+
+    double distance_to_point(const GeoPoint& p)
+    {
+        double dlat = lat_ - p.lat;
+        double dlon = lon_ - p.lon;
+        return std::sqrt(dlat * dlat + dlon * dlon);
+    }
+
+    void move_towards(const GeoPoint& target, double step)
+    {
+        double dlat = target.lat - lat_;
+        double dlon = target.lon - lon_;
+
+        double dist = std::sqrt(dlat * dlat + dlon * dlon);
+
+        if (dist <= step || dist == 0.0)
+        {
+            lat_ = target.lat;
+            lon_ = target.lon;
+            return;
+        }
+
+        lat_ += step * dlat / dist;
+        lon_ += step * dlon / dist;
+    }
+
+    void update_simulated_values()
+    {
+        const double MOVE_STEP = 0.00008;
+
+        if (status_ == "ON_MISSION" && delivery_mode_)
+        {
+            // 1) Dron ide do izlazne tačke na konturi.
+            if (!reached_exit_point_)
+            {
+                move_towards(exit_point_, MOVE_STEP);
+
+                if (distance_to_point(exit_point_) < MOVE_STEP)
+                {
+                    reached_exit_point_ = true;
+                    status_ = "DELIVERY_APPROACH";
+
+                    std::cout << "[DRONE] Reached nearest point on contour. "
+                              << "Leaving contour toward delivery point.\n";
+                }
+
+                return;
+            }
+        }
+
+        if (status_ == "DELIVERY_APPROACH")
+        {
+            // 2) Dron ide od konture do dostavne tačke.
+            move_towards(delivery_point_, MOVE_STEP);
+
+            if (distance_to_point(delivery_point_) < MOVE_STEP)
+            {
+                status_ = "DELIVERING";
+                std::cout << "[DRONE] Reached delivery point.\n";
+            }
+
+            return;
+        }
+
+        if (status_ == "DELIVERING")
+        {
+            // 3) Simulacija predaje paketa.
+            package_delivered_ = true;
+
+            std::cout << "[DRONE] Package delivered.\n";
+
+            finish_mission();
+            return;
+        }
+
+        if (status_ == "ON_MISSION" && !route_points_.empty())
+        {
+            // Obično kretanje po kockastoj konturi.
+            GeoPoint target = route_points_[current_waypoint_];
+
+            move_towards(target, MOVE_STEP);
+
+            if (distance_to_point(target) < MOVE_STEP)
+            {
+                current_waypoint_++;
+
+                if (current_waypoint_ >= route_points_.size())
+                {
+                    current_waypoint_ = 0;
+
+                    if (mission_type_ == "TEST_FLIGHT")
+                    {
+                        finish_mission();
+                    }
+                }
+            }
+        }
     }
 
     void start_read()
@@ -265,13 +427,15 @@ private:
                     std::string line;
                     std::getline(is, line);
 
-                    if (!line.empty()) handle_server_message(line);
+                    if (!line.empty())
+                        handle_server_message(line);
 
                     start_read();
                 }
                 else
                 {
-                    std::cerr << "[DRONE] Server disconnected: " << ec.message() << std::endl;
+                    std::cerr << "[DRONE] Server disconnected: "
+                              << ec.message() << std::endl;
                 }
             });
     }
@@ -281,6 +445,7 @@ private:
         try
         {
             json msg = json::parse(line);
+
             std::string type = msg.value("TYPE", "UNKNOWN");
 
             std::cout << "[DRONE] Received: " << msg.dump() << std::endl;
@@ -293,78 +458,182 @@ private:
             else if (type == "AUTH_ACK")
             {
                 status_ = "IDLE";
+
+                std::cout << "[DRONE] Authenticated. Starting timers.\n";
+
                 start_keepalive();
                 start_telemetry();
+                start_battery_timer();
+
                 send_mission_request();
             }
             else if (type == "MISSION_APPROVED")
             {
                 mission_id_ = msg.value("MISSION_ID", mission_id_);
+                mission_type_ = msg.value("MISSION_TYPE", mission_type_);
                 active_route_id_ = msg.value("ROUTE_ID", route_id_);
                 altitude_ = msg.value("ALTITUDE", altitude_);
 
                 double center_lat = msg.value("CENTER_LAT", lat_);
                 double center_lon = msg.value("CENTER_LON", lon_);
-                int radius_m = msg.value("RADIUS_M", 100);
+                int half_size_m = msg.value("HALF_SIZE_M", 250);
 
-                route_points_ = generate_contour(center_lat, center_lon, radius_m);
+                route_points_ = generate_square_contour(center_lat, center_lon, half_size_m);
                 current_waypoint_ = 0;
+                mission_finished_sent_ = false;
+
+                delivery_mode_ = false;
+                reached_exit_point_ = false;
+                package_delivered_ = false;
+
+                if (mission_type_ == "DELIVERY")
+                {
+                    delivery_mode_ = true;
+
+                    exit_point_.lat = msg.value("EXIT_LAT", lat_);
+                    exit_point_.lon = msg.value("EXIT_LON", lon_);
+
+                    delivery_point_.lat = msg.value("DELIVERY_LAT", lat_);
+                    delivery_point_.lon = msg.value("DELIVERY_LON", lon_);
+                }
+
                 status_ = "ON_MISSION";
 
-                std::cout << "[DRONE] Mission approved | route=" << active_route_id_
-                          << " radius=" << radius_m
-                          << " alt=" << altitude_
+                std::cout << "[DRONE] Mission approved. "
+                          << "type=" << mission_type_
+                          << " route=" << active_route_id_
+                          << " half_size=" << half_size_m << "m"
+                          << " altitude=" << altitude_
                           << " slot=" << msg.value("ALTITUDE_SLOT", -1)
                           << std::endl;
+
+                if (mission_type_ == "DELIVERY")
+                {
+                    std::cout << "[DRONE] Delivery path: contour -> exit point ("
+                              << exit_point_.lat << "," << exit_point_.lon
+                              << ") -> delivery point ("
+                              << delivery_point_.lat << "," << delivery_point_.lon
+                              << ")\n";
+                }
             }
             else if (type == "MISSION_REJECTED")
             {
                 status_ = "IDLE";
-                std::cout << "[DRONE] Mission rejected: " << msg.value("REASON", "UNKNOWN") << std::endl;
+                std::cout << "[DRONE] Mission rejected: "
+                          << msg.value("REASON", "UNKNOWN") << std::endl;
             }
             else if (type == "ACK_MISSION_FINISHED")
             {
                 std::cout << "[DRONE] Central acknowledged mission finish.\n";
             }
+            else if (type == "CHANGE_PARAMS")
+            {
+                handle_change_params(msg);
+            }
             else if (type == "RETURN_TO_BASE")
             {
-                lat_ = msg.value("BASE_LAT", lat_);
-                lon_ = msg.value("BASE_LON", lon_);
+                double base_lat = msg.value("BASE_LAT", lat_);
+                double base_lon = msg.value("BASE_LON", lon_);
+
                 status_ = "RETURN_TO_BASE";
+                lat_ = base_lat;
+                lon_ = base_lon;
+
+                std::cout << "[DRONE] Returning to base: "
+                          << base_lat << ", " << base_lon << std::endl;
 
                 json ack;
                 ack["TYPE"] = "ACK_RTB";
                 ack["DRONE_URI"] = drone_uri_;
+                ack["BASE_LAT"] = base_lat;
+                ack["BASE_LON"] = base_lon;
+                send_json(ack);
+            }
+            else if (type == "STOP_MISSION")
+            {
+                status_ = "IDLE";
+                std::cout << "[DRONE] Mission stopped.\n";
+
+                json ack;
+                ack["TYPE"] = "ACK_STOP";
+                ack["DRONE_URI"] = drone_uri_;
                 send_json(ack);
             }
         }
-        catch (const std::exception& e)
+        catch (std::exception& e)
         {
-            std::cerr << "[DRONE] Invalid JSON: " << e.what() << std::endl;
+            std::cerr << "[DRONE] Invalid JSON from server: "
+                      << e.what() << std::endl;
         }
+    }
+
+    void handle_change_params(const json& msg)
+    {
+        int new_altitude = msg.value("ALTITUDE", altitude_);
+        int new_speed = msg.value("SPEED", speed_);
+        std::string new_direction = msg.value("DIRECTION", direction_);
+
+        if (new_altitude < 20 || new_altitude > 500 || new_speed < 0 || new_speed > 50)
+        {
+            json err;
+            err["TYPE"] = "ERROR_PARAMS";
+            err["DRONE_URI"] = drone_uri_;
+            err["MESSAGE"] = "Invalid altitude or speed";
+
+            send_json(err);
+
+            std::cout << "[DRONE] Invalid flight parameters.\n";
+            return;
+        }
+
+        altitude_ = new_altitude;
+        speed_ = new_speed;
+        direction_ = new_direction;
+
+        json ack;
+        ack["TYPE"] = "ACK_PARAMS";
+        ack["DRONE_URI"] = drone_uri_;
+        ack["ALTITUDE"] = altitude_;
+        ack["SPEED"] = speed_;
+        ack["DIRECTION"] = direction_;
+
+        send_json(ack);
+
+        std::cout << "[DRONE] New parameters applied.\n";
     }
 
     void send_json(const json& msg)
     {
         std::string data = msg.dump() + "\n";
-        bool writing = !write_queue_.empty();
+
+        bool write_in_progress = !write_queue_.empty();
         write_queue_.push_back(data);
-        if (!writing) do_write();
+
+        if (!write_in_progress)
+        {
+            do_write();
+        }
     }
 
     void do_write()
     {
-        boost::asio::async_write(socket_, boost::asio::buffer(write_queue_.front()),
+        boost::asio::async_write(socket_,
+            boost::asio::buffer(write_queue_.front()),
             [this](boost::system::error_code ec, std::size_t)
             {
                 if (!ec)
                 {
                     write_queue_.pop_front();
-                    if (!write_queue_.empty()) do_write();
+
+                    if (!write_queue_.empty())
+                    {
+                        do_write();
+                    }
                 }
                 else
                 {
-                    std::cerr << "[DRONE] Write error: " << ec.message() << std::endl;
+                    std::cerr << "[DRONE] Write error: "
+                              << ec.message() << std::endl;
                 }
             });
     }
@@ -374,19 +643,26 @@ private:
     tcp::socket socket_;
     tcp::resolver resolver_;
     boost::asio::streambuf read_buffer_;
+
     boost::asio::steady_timer keepalive_timer_;
     boost::asio::steady_timer telemetry_timer_;
+    boost::asio::steady_timer battery_timer_;
+
     std::deque<std::string> write_queue_;
 
     std::string host_;
     std::string port_;
     std::string drone_uri_;
     std::string token_;
+
     std::string zone_;
     std::string mission_type_;
     std::string route_id_;
     std::string active_route_id_;
     std::string mission_id_;
+
+    double delivery_lat_;
+    double delivery_lon_;
 
     int battery_;
     double lat_;
@@ -398,24 +674,49 @@ private:
 
     std::vector<GeoPoint> route_points_;
     std::size_t current_waypoint_;
+
+    bool delivery_mode_;
+    GeoPoint exit_point_;
+    GeoPoint delivery_point_;
+    bool reached_exit_point_;
+    bool package_delivered_;
+    bool mission_finished_sent_;
 };
 
 int main(int argc, char* argv[])
 {
-    if (argc < 7 || argc > 9)
+    if (argc < 7 || argc > 11)
     {
-        std::cerr << "Usage: ./drone_client <regional_host> <regional_port> <drone_uri> <token> <zone> <mission_type> [route_id] [base_altitude]\n";
-        std::cerr << "Primjer: ./drone_client 127.0.0.1 8000 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
+        std::cerr << "Usage: ./drone_client <regional_host> <regional_port> "
+                  << "<drone_uri> <token> <zone> <mission_type> "
+                  << "[route_id] [base_altitude] [delivery_lat] [delivery_lon]\n\n";
+
+        std::cerr << "Primjeri:\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 DRON_DEL abc123 SKENDERIJA DELIVERY AUTO 120 43.8580 18.4160\n";
         return 1;
     }
 
     std::string route_id = (argc >= 8) ? argv[7] : "AUTO";
     int base_altitude = (argc >= 9) ? std::atoi(argv[8]) : 120;
 
+    double delivery_lat = 0.0;
+    double delivery_lon = 0.0;
+
+    if (argc >= 11)
+    {
+        delivery_lat = std::stod(argv[9]);
+        delivery_lon = std::stod(argv[10]);
+    }
+
     boost::asio::io_context io;
 
-    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], route_id, base_altitude);
+    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4],
+                      argv[5], argv[6], route_id, base_altitude,
+                      delivery_lat, delivery_lon);
+
     drone.start();
+
     io.run();
 
     return 0;
