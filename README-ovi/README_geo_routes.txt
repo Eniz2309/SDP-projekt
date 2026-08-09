@@ -13,9 +13,9 @@ Ova verzija uvodi:
 Ako je `include` folder u istom direktoriju:
 
 ```bash
-g++ -std=c++11 -I include central_server_geo_routes.cpp -o central_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I include regional_server_geo_routes.cpp -o regional_server -lboost_system -lsqlite3 -pthread
-g++ -std=c++11 -I include drone_client_geo_routes.cpp -o drone_client -lboost_system -pthread
+g++ -std=c++11 -I include central_server.cpp -o central_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I include regional_server.cpp -o regional_server -lboost_system -lsqlite3 -pthread
+g++ -std=c++11 -I include drone_client.cpp -o drone_client -lboost_system -pthread
 ```
 
 Ako je `include` folder jedan nivo iznad:
