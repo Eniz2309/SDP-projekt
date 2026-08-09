@@ -1,12 +1,21 @@
 // central_server.cpp
-// Verzija usklađena sa LV9-10: Boost.Asio + JSON + SQLITE3 prema LV9-10
+// Centralni server za autonomne dronove.
+// Funkcionalnosti:
+// - registracija regionalnih servera sa bazom i zonama
+// - generisanje pravougaonih/kockastih kontura kao ruta
+// - DELIVERY: izbor najbliže konture i izlazne tačke prema dostavnoj tački
+// - maksimalno 3 drona po istoj ruti, visinski slotovi po 2m
+// - čuvanje statusa dronova, misija i alarma u SQLite bazi
+
 #include <boost/asio.hpp>
 #include <iostream>
-#include <thread>
-#include <mutex>
 #include <memory>
-#include <vector>
+#include <mutex>
+#include <string>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
+
 #include <sqlite3.h>
 #include "json/json.h"
 #include "sqlite3_wrapper.h"
@@ -18,8 +27,51 @@ namespace sqlite = sqlite3_wrapper;
 std::unique_ptr<sqlite::db> g_db;
 std::mutex db_mutex;
 
-const int DEFAULT_MAX_DRONES = 3;
-const int DEFAULT_VERTICAL_SEPARATION = 2;
+const int DEFAULT_MAX_DRONES_PER_ROUTE = 3;
+const int DEFAULT_VERTICAL_SEPARATION_M = 2;
+
+struct LocalPoint
+{
+    double north_m;
+    double east_m;
+};
+
+struct GeoPoint
+{
+    double lat;
+    double lon;
+};
+
+struct ZoneInfo
+{
+    bool found;
+    double center_lat;
+    double center_lon;
+    int radius_m;
+    int contours;
+
+    ZoneInfo() : found(false), center_lat(0), center_lon(0), radius_m(0), contours(0) {}
+};
+
+struct RouteInfo
+{
+    bool found;
+    std::string route_type;
+    int contour_level;
+    int half_size_m;
+    double center_lat;
+    double center_lon;
+    int max_drones;
+    int vertical_separation;
+
+    RouteInfo()
+        : found(false), contour_level(0), half_size_m(0),
+          center_lat(0), center_lon(0),
+          max_drones(DEFAULT_MAX_DRONES_PER_ROUTE),
+          vertical_separation(DEFAULT_VERTICAL_SEPARATION_M)
+    {
+    }
+};
 
 void exec_sql(const std::string& sql)
 {
@@ -29,94 +81,300 @@ void exec_sql(const std::string& sql)
 
 void init_database()
 {
-    exec_sql("CREATE TABLE IF NOT EXISTS regional_servers (region_id TEXT PRIMARY KEY, base_lat REAL, base_lon REAL, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP);");
-    exec_sql("CREATE TABLE IF NOT EXISTS zones (region_id TEXT, zone_id TEXT, center_lat REAL, center_lon REAL, radius_m INTEGER, contours INTEGER, PRIMARY KEY(region_id, zone_id));");
-    exec_sql("CREATE TABLE IF NOT EXISTS zone_routes (region_id TEXT, zone_id TEXT, route_id TEXT, route_type TEXT, contour_level INTEGER, radius_m INTEGER, center_lat REAL, center_lon REAL, max_drones INTEGER, vertical_separation INTEGER, PRIMARY KEY(region_id, zone_id, route_id));");
-    exec_sql("CREATE TABLE IF NOT EXISTS drones (drone_uri TEXT PRIMARY KEY, region_id TEXT, battery INTEGER, status TEXT, lat REAL, lon REAL, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP);");
-    exec_sql("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, drone_uri TEXT, region_id TEXT, mission_type TEXT, zone TEXT, route_id TEXT, altitude INTEGER, altitude_slot INTEGER, status TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, finished_at DATETIME);");
-    exec_sql("CREATE TABLE IF NOT EXISTS alarms (id INTEGER PRIMARY KEY AUTOINCREMENT, drone_uri TEXT, alarm_type TEXT, message TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);");
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS regional_servers (
+            region_id TEXT PRIMARY KEY,
+            base_lat REAL,
+            base_lon REAL,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS zones (
+            region_id TEXT,
+            zone_id TEXT,
+            center_lat REAL,
+            center_lon REAL,
+            radius_m INTEGER,
+            contours INTEGER,
+            PRIMARY KEY(region_id, zone_id)
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS zone_routes (
+            region_id TEXT,
+            zone_id TEXT,
+            route_id TEXT,
+            route_type TEXT,
+            contour_level INTEGER,
+            half_size_m INTEGER,
+            max_drones INTEGER,
+            vertical_separation INTEGER,
+            PRIMARY KEY(region_id, zone_id, route_id)
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS drones (
+            drone_uri TEXT PRIMARY KEY,
+            region_id TEXT,
+            battery INTEGER,
+            status TEXT,
+            lat REAL,
+            lon REAL,
+            altitude INTEGER,
+            route_id TEXT,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS missions (
+            mission_id TEXT PRIMARY KEY,
+            drone_uri TEXT,
+            region_id TEXT,
+            mission_type TEXT,
+            zone TEXT,
+            route_id TEXT,
+            altitude INTEGER,
+            altitude_slot INTEGER,
+            delivery_lat REAL,
+            delivery_lon REAL,
+            exit_lat REAL,
+            exit_lon REAL,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            finished_at DATETIME
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS alarms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drone_uri TEXT,
+            alarm_type TEXT,
+            message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    )");
 }
 
-bool count_query(const std::string& sql, const std::string& a, const std::string& b, int& count)
+LocalPoint latlon_to_offset(double center_lat, double center_lon, double lat, double lon)
 {
-    auto stmt = g_db->prepare(sql);
-    stmt.execute(a, b);
-    return stmt.fetch(count);
+    const double PI = 3.14159265358979323846;
+
+    double meters_per_deg_lat = 111320.0;
+    double meters_per_deg_lon = 111320.0 * std::cos(center_lat * PI / 180.0);
+
+    LocalPoint p;
+    p.north_m = (lat - center_lat) * meters_per_deg_lat;
+    p.east_m = (lon - center_lon) * meters_per_deg_lon;
+
+    return p;
 }
 
-bool count_query3(const std::string& sql, const std::string& a, const std::string& b, const std::string& c, int& count)
+GeoPoint offset_to_latlon(double center_lat, double center_lon, double north_m, double east_m)
 {
-    auto stmt = g_db->prepare(sql);
-    stmt.execute(a, b, c);
-    return stmt.fetch(count);
+    const double PI = 3.14159265358979323846;
+
+    double meters_per_deg_lat = 111320.0;
+    double meters_per_deg_lon = 111320.0 * std::cos(center_lat * PI / 180.0);
+
+    GeoPoint p;
+    p.lat = center_lat + north_m / meters_per_deg_lat;
+    p.lon = center_lon + east_m / meters_per_deg_lon;
+
+    return p;
 }
 
-bool zone_exists(const std::string& region_id, const std::string& zone_id)
+LocalPoint closest_point_on_square_contour(double delivery_north,
+                                           double delivery_east,
+                                           double half_size_m)
 {
-    std::lock_guard<std::mutex> lock(db_mutex);
-    int count = 0;
-    count_query("SELECT COUNT(*) FROM zones WHERE region_id = ? AND zone_id = ?;", region_id, zone_id, count);
-    return count > 0;
-}
+    LocalPoint exit_point;
 
-bool route_exists(const std::string& region_id, const std::string& zone_id, const std::string& route_id)
-{
-    std::lock_guard<std::mutex> lock(db_mutex);
-    int count = 0;
-    count_query3("SELECT COUNT(*) FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;", region_id, zone_id, route_id, count);
-    return count > 0;
-}
+    double abs_north = std::abs(delivery_north);
+    double abs_east = std::abs(delivery_east);
 
-int get_route_int(const std::string& column, const std::string& region_id, const std::string& zone_id, const std::string& route_id, int def)
-{
-    std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("SELECT " + column + " FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;");
-    stmt.execute(region_id, zone_id, route_id);
-    int value = def;
-    if (stmt.fetch(value)) return value;
-    return def;
-}
-
-double get_route_double(const std::string& column, const std::string& region_id, const std::string& zone_id, const std::string& route_id, double def)
-{
-    std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("SELECT " + column + " FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;");
-    stmt.execute(region_id, zone_id, route_id);
-    double value = def;
-    if (stmt.fetch(value)) return value;
-    return def;
-}
-
-std::string get_route_string(const std::string& column, const std::string& region_id, const std::string& zone_id, const std::string& route_id, const std::string& def)
-{
-    std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("SELECT " + column + " FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;");
-    stmt.execute(region_id, zone_id, route_id);
-    std::string value = def;
-    if (stmt.fetch(value)) return value;
-    return def;
-}
-
-bool assign_altitude_slot(const std::string& region_id, const std::string& zone, const std::string& route_id, int base_altitude, int max_drones, int vertical_sep, int& assigned_altitude, int& assigned_slot)
-{
-    std::vector<bool> used(max_drones, false);
-
-    std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("SELECT altitude_slot FROM missions WHERE status = 'ACTIVE' AND region_id = ? AND zone = ? AND route_id = ?;");
-    stmt.execute(region_id, zone, route_id);
-
-    int slot = 0;
-    while (stmt.fetch(slot))
+    if (abs_east >= abs_north)
     {
-        if (slot >= 0 && slot < max_drones) used[slot] = true;
+        // Najbliža je lijeva/desna ivica konture.
+        exit_point.east_m = (delivery_east >= 0) ? half_size_m : -half_size_m;
+        exit_point.north_m = std::max(-half_size_m, std::min(half_size_m, delivery_north));
+    }
+    else
+    {
+        // Najbliža je gornja/donja ivica konture.
+        exit_point.north_m = (delivery_north >= 0) ? half_size_m : -half_size_m;
+        exit_point.east_m = std::max(-half_size_m, std::min(half_size_m, delivery_east));
     }
 
-    for (int i = 0; i < max_drones; i++)
+    return exit_point;
+}
+
+int choose_delivery_contour(double delivery_north,
+                            double delivery_east,
+                            int zone_radius_m,
+                            int contours)
+{
+    double distance_square = std::max(std::abs(delivery_north), std::abs(delivery_east));
+
+    if (distance_square > zone_radius_m)
     {
-        if (!used[i])
+        return -1;
+    }
+
+    double step = static_cast<double>(zone_radius_m) / contours;
+    int level = static_cast<int>(std::round(distance_square / step));
+
+    if (level < 1)
+        level = 1;
+
+    if (level > contours)
+        level = contours;
+
+    return level;
+}
+
+bool zone_exists(const std::string& region_id, const std::string& zone)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto stmt = g_db->prepare(
+        "SELECT COUNT(*) FROM zones WHERE region_id = ? AND zone_id = ?;"
+    );
+
+    stmt.execute(region_id, zone);
+
+    int count = 0;
+    if (stmt.fetch(count))
+    {
+        return count > 0;
+    }
+
+    return false;
+}
+
+ZoneInfo get_zone_info(const std::string& region_id, const std::string& zone)
+{
+    ZoneInfo result;
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto stmt = g_db->prepare(
+        "SELECT center_lat FROM zones WHERE region_id = ? AND zone_id = ?;"
+    );
+    stmt.execute(region_id, zone);
+    if (!stmt.fetch(result.center_lat))
+        return result;
+
+    stmt = g_db->prepare(
+        "SELECT center_lon FROM zones WHERE region_id = ? AND zone_id = ?;"
+    );
+    stmt.execute(region_id, zone);
+    stmt.fetch(result.center_lon);
+
+    stmt = g_db->prepare(
+        "SELECT radius_m FROM zones WHERE region_id = ? AND zone_id = ?;"
+    );
+    stmt.execute(region_id, zone);
+    stmt.fetch(result.radius_m);
+
+    stmt = g_db->prepare(
+        "SELECT contours FROM zones WHERE region_id = ? AND zone_id = ?;"
+    );
+    stmt.execute(region_id, zone);
+    stmt.fetch(result.contours);
+
+    result.found = true;
+    return result;
+}
+
+RouteInfo get_route_info(const std::string& region_id,
+                         const std::string& zone,
+                         const std::string& route_id)
+{
+    RouteInfo result;
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto stmt = g_db->prepare(
+        "SELECT route_type FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;"
+    );
+    stmt.execute(region_id, zone, route_id);
+    if (!stmt.fetch(result.route_type))
+        return result;
+
+    stmt = g_db->prepare(
+        "SELECT contour_level FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;"
+    );
+    stmt.execute(region_id, zone, route_id);
+    stmt.fetch(result.contour_level);
+
+    stmt = g_db->prepare(
+        "SELECT half_size_m FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;"
+    );
+    stmt.execute(region_id, zone, route_id);
+    stmt.fetch(result.half_size_m);
+
+    stmt = g_db->prepare(
+        "SELECT max_drones FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;"
+    );
+    stmt.execute(region_id, zone, route_id);
+    stmt.fetch(result.max_drones);
+
+    stmt = g_db->prepare(
+        "SELECT vertical_separation FROM zone_routes WHERE region_id = ? AND zone_id = ? AND route_id = ?;"
+    );
+    stmt.execute(region_id, zone, route_id);
+    stmt.fetch(result.vertical_separation);
+
+    result.found = true;
+    return result;
+}
+
+bool assign_altitude_slot(const std::string& region_id,
+                          const std::string& zone,
+                          const std::string& route_id,
+                          const RouteInfo& route,
+                          int base_altitude,
+                          int& assigned_altitude,
+                          int& assigned_slot)
+{
+    std::vector<bool> used_slots(route.max_drones, false);
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto stmt = g_db->prepare(R"(
+            SELECT altitude_slot
+            FROM missions
+            WHERE status = 'ACTIVE'
+              AND region_id = ?
+              AND zone = ?
+              AND route_id = ?;
+        )");
+
+        stmt.execute(region_id, zone, route_id);
+
+        int slot = 0;
+        while (stmt.fetch(slot))
+        {
+            if (slot >= 0 && slot < route.max_drones)
+            {
+                used_slots[slot] = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < route.max_drones; i++)
+    {
+        if (!used_slots[i])
         {
             assigned_slot = i;
-            assigned_altitude = base_altitude + i * vertical_sep;
+            assigned_altitude = base_altitude + i * route.vertical_separation;
             return true;
         }
     }
@@ -129,47 +387,71 @@ void handle_region_register(const json& msg)
     std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
     double base_lat = msg.value("BASE_LAT", 0.0);
     double base_lon = msg.value("BASE_LON", 0.0);
+
     json zones = msg.value("ZONES", json::array());
 
-    std::lock_guard<std::mutex> lock(db_mutex);
-
-    auto region_stmt = g_db->prepare("INSERT OR REPLACE INTO regional_servers(region_id, base_lat, base_lon, last_seen) VALUES (?, ?, ?, CURRENT_TIMESTAMP);");
-    region_stmt.execute(region_id, base_lat, base_lon);
-
-    auto del_zones = g_db->prepare("DELETE FROM zones WHERE region_id = ?;");
-    del_zones.execute(region_id);
-
-    auto del_routes = g_db->prepare("DELETE FROM zone_routes WHERE region_id = ?;");
-    del_routes.execute(region_id);
-
-    auto zone_stmt = g_db->prepare("INSERT OR REPLACE INTO zones(region_id, zone_id, center_lat, center_lon, radius_m, contours) VALUES (?, ?, ?, ?, ?, ?);");
-    auto route_stmt = g_db->prepare("INSERT OR REPLACE INTO zone_routes(region_id, zone_id, route_id, route_type, contour_level, radius_m, center_lat, center_lon, max_drones, vertical_separation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
-
-    for (const auto& z : zones)
     {
-        std::string zone_id = z.value("ZONE_ID", "");
-        double center_lat = z.value("CENTER_LAT", 0.0);
-        double center_lon = z.value("CENTER_LON", 0.0);
-        int radius_m = z.value("RADIUS_M", 1000);
-        int contours = z.value("CONTOURS", 4);
+        std::lock_guard<std::mutex> lock(db_mutex);
 
-        if (zone_id.empty()) continue;
+        auto region_stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO regional_servers(region_id, base_lat, base_lon, last_seen)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP);
+        )");
+        region_stmt.execute(region_id, base_lat, base_lon);
 
-        zone_stmt.execute(region_id, zone_id, center_lat, center_lon, radius_m, contours);
+        auto dz = g_db->prepare("DELETE FROM zones WHERE region_id = ?;");
+        dz.execute(region_id);
 
-        for (int level = 1; level <= contours; level++)
+        auto dr = g_db->prepare("DELETE FROM zone_routes WHERE region_id = ?;");
+        dr.execute(region_id);
+
+        auto zone_stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO zones
+            (region_id, zone_id, center_lat, center_lon, radius_m, contours)
+            VALUES (?, ?, ?, ?, ?, ?);
+        )");
+
+        auto route_stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO zone_routes
+            (region_id, zone_id, route_id, route_type, contour_level, half_size_m, max_drones, vertical_separation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        )");
+
+        for (const auto& z : zones)
         {
-            std::string route_id = zone_id + "_K" + std::to_string(level);
-            int contour_radius = (radius_m * level) / contours;
+            std::string zone_id = z.value("ZONE_ID", "");
+            double center_lat = z.value("CENTER_LAT", 0.0);
+            double center_lon = z.value("CENTER_LON", 0.0);
+            int radius_m = z.value("RADIUS_M", 1000);
+            int contours = z.value("CONTOURS", 4);
 
-            route_stmt.execute(region_id, zone_id, route_id, "CONTOUR", level, contour_radius, center_lat, center_lon, DEFAULT_MAX_DRONES, DEFAULT_VERTICAL_SEPARATION);
+            if (zone_id.empty())
+                continue;
+
+            zone_stmt.execute(region_id, zone_id, center_lat, center_lon, radius_m, contours);
+
+            for (int level = 1; level <= contours; level++)
+            {
+                std::string route_id = zone_id + "_K" + std::to_string(level);
+                int half_size_m = (radius_m * level) / contours;
+
+                route_stmt.execute(region_id, zone_id, route_id, "CONTOUR",
+                                   level, half_size_m,
+                                   DEFAULT_MAX_DRONES_PER_ROUTE,
+                                   DEFAULT_VERTICAL_SEPARATION_M);
+            }
+
+            std::string connector_id = zone_id + "_DIAGONAL";
+            route_stmt.execute(region_id, zone_id, connector_id, "CONNECTOR",
+                               0, radius_m,
+                               1,
+                               DEFAULT_VERTICAL_SEPARATION_M);
         }
-
-        std::string diagonal_id = zone_id + "_DIAGONAL";
-        route_stmt.execute(region_id, zone_id, diagonal_id, "CONNECTOR", 0, radius_m, center_lat, center_lon, 1, DEFAULT_VERTICAL_SEPARATION);
     }
 
-    std::cout << "[CENTRAL] Registrovan region " << region_id << " | zona: " << zones.size() << std::endl;
+    std::cout << "[CENTRAL] Registrovan region " << region_id
+              << " | baza: " << base_lat << ", " << base_lon
+              << " | broj zona: " << zones.size() << std::endl;
 }
 
 void handle_drone_status(const json& msg)
@@ -180,23 +462,76 @@ void handle_drone_status(const json& msg)
     std::string status = msg.value("STATUS", "UNKNOWN");
     double lat = msg.value("LAT", 0.0);
     double lon = msg.value("LON", 0.0);
+    int altitude = msg.value("ALTITUDE", 0);
+    std::string route_id = msg.value("ROUTE_ID", "");
 
     std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("INSERT OR REPLACE INTO drones(drone_uri, region_id, battery, status, lat, lon, last_seen) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);");
-    stmt.execute(drone_uri, region_id, battery, status, lat, lon);
+
+    auto stmt = g_db->prepare(R"(
+        INSERT OR REPLACE INTO drones
+        (drone_uri, region_id, battery, status, lat, lon, altitude, route_id, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+    )");
+
+    stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, route_id);
+
+    std::cout << "[CENTRAL] Status drona: " << drone_uri
+              << " | " << status
+              << " | battery=" << battery << "%" << std::endl;
+}
+
+void handle_alarm(const json& msg)
+{
+    std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    std::string alarm_type = msg.value("ALARM_TYPE", "UNKNOWN_ALARM");
+    std::string message = msg.value("MESSAGE", "");
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto stmt = g_db->prepare(R"(
+        INSERT INTO alarms(drone_uri, alarm_type, message)
+        VALUES (?, ?, ?);
+    )");
+
+    stmt.execute(drone_uri, alarm_type, message);
+
+    std::cout << "[CENTRAL] Alarm za " << drone_uri
+              << " | " << alarm_type << std::endl;
 }
 
 json handle_mission_finished(const json& msg)
 {
     json response;
-    std::string mission_id = msg.value("MISSION_ID", "");
 
-    std::lock_guard<std::mutex> lock(db_mutex);
-    auto stmt = g_db->prepare("UPDATE missions SET status = 'FINISHED', finished_at = CURRENT_TIMESTAMP WHERE mission_id = ?;");
-    stmt.execute(mission_id);
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+
+    if (mission_id.empty())
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_MISSION_ID";
+        return response;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET status = 'FINISHED',
+                finished_at = CURRENT_TIMESTAMP
+            WHERE mission_id = ?;
+        )");
+
+        stmt.execute(mission_id);
+    }
 
     response["TYPE"] = "ACK_MISSION_FINISHED";
     response["MISSION_ID"] = mission_id;
+    response["DRONE_URI"] = drone_uri;
+
+    std::cout << "[CENTRAL] Misija završena: " << mission_id << std::endl;
+
     return response;
 }
 
@@ -209,8 +544,8 @@ json handle_mission_request(const json& msg)
     std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
     std::string mission_type = msg.value("MISSION_TYPE", "TEST_FLIGHT");
     std::string zone = msg.value("ZONE", "");
-    std::string route_id = msg.value("ROUTE_ID", "AUTO");
-    int base_altitude = msg.value("ALTITUDE", 120);
+    std::string route_id = msg.value("ROUTE_ID", "");
+    int requested_altitude = msg.value("ALTITUDE", 120);
 
     if (!zone_exists(region_id, zone))
     {
@@ -220,9 +555,83 @@ json handle_mission_request(const json& msg)
         return response;
     }
 
-    if (route_id.empty() || route_id == "AUTO") route_id = zone + "_K1";
+    ZoneInfo zone_info = get_zone_info(region_id, zone);
 
-    if (!route_exists(region_id, zone, route_id))
+    if (!zone_info.found)
+    {
+        response["TYPE"] = "MISSION_REJECTED";
+        response["MISSION_ID"] = mission_id;
+        response["REASON"] = "ZONE_INFO_NOT_FOUND";
+        return response;
+    }
+
+    double delivery_lat = msg.value("DELIVERY_LAT", 0.0);
+    double delivery_lon = msg.value("DELIVERY_LON", 0.0);
+    GeoPoint exit_geo;
+    exit_geo.lat = 0.0;
+    exit_geo.lon = 0.0;
+
+    if (mission_type == "DELIVERY")
+    {
+        if (delivery_lat == 0.0 && delivery_lon == 0.0)
+        {
+            response["TYPE"] = "MISSION_REJECTED";
+            response["MISSION_ID"] = mission_id;
+            response["REASON"] = "MISSING_DELIVERY_POINT";
+            return response;
+        }
+
+        LocalPoint delivery_offset = latlon_to_offset(
+            zone_info.center_lat,
+            zone_info.center_lon,
+            delivery_lat,
+            delivery_lon
+        );
+
+        int level = choose_delivery_contour(
+            delivery_offset.north_m,
+            delivery_offset.east_m,
+            zone_info.radius_m,
+            zone_info.contours
+        );
+
+        if (level < 0)
+        {
+            response["TYPE"] = "MISSION_REJECTED";
+            response["MISSION_ID"] = mission_id;
+            response["REASON"] = "DELIVERY_POINT_OUTSIDE_ZONE";
+            return response;
+        }
+
+        route_id = zone + "_K" + std::to_string(level);
+
+        int half_size_m = (zone_info.radius_m * level) / zone_info.contours;
+
+        LocalPoint exit_local = closest_point_on_square_contour(
+            delivery_offset.north_m,
+            delivery_offset.east_m,
+            half_size_m
+        );
+
+        exit_geo = offset_to_latlon(
+            zone_info.center_lat,
+            zone_info.center_lon,
+            exit_local.north_m,
+            exit_local.east_m
+        );
+    }
+    else
+    {
+        if (route_id.empty() || route_id == "AUTO")
+        {
+            // Testni let i default misije idu na prvu konturu.
+            route_id = zone + "_K1";
+        }
+    }
+
+    RouteInfo route = get_route_info(region_id, zone, route_id);
+
+    if (!route.found)
     {
         response["TYPE"] = "MISSION_REJECTED";
         response["MISSION_ID"] = mission_id;
@@ -230,18 +639,13 @@ json handle_mission_request(const json& msg)
         return response;
     }
 
-    std::string route_type = get_route_string("route_type", region_id, zone, route_id, "CONTOUR");
-    int contour_level = get_route_int("contour_level", region_id, zone, route_id, 1);
-    int radius_m = get_route_int("radius_m", region_id, zone, route_id, 100);
-    double center_lat = get_route_double("center_lat", region_id, zone, route_id, 0.0);
-    double center_lon = get_route_double("center_lon", region_id, zone, route_id, 0.0);
-    int max_drones = get_route_int("max_drones", region_id, zone, route_id, DEFAULT_MAX_DRONES);
-    int vertical_sep = get_route_int("vertical_separation", region_id, zone, route_id, DEFAULT_VERTICAL_SEPARATION);
-
     int assigned_altitude = 0;
     int assigned_slot = -1;
 
-    if (!assign_altitude_slot(region_id, zone, route_id, base_altitude, max_drones, vertical_sep, assigned_altitude, assigned_slot))
+    if (!assign_altitude_slot(region_id, zone, route_id, route,
+                              requested_altitude,
+                              assigned_altitude,
+                              assigned_slot))
     {
         response["TYPE"] = "MISSION_REJECTED";
         response["MISSION_ID"] = mission_id;
@@ -251,108 +655,200 @@ json handle_mission_request(const json& msg)
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
-        auto stmt = g_db->prepare("INSERT INTO missions(mission_id, drone_uri, region_id, mission_type, zone, route_id, altitude, altitude_slot, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE');");
-        stmt.execute(mission_id, drone_uri, region_id, mission_type, zone, route_id, assigned_altitude, assigned_slot);
+
+        auto stmt = g_db->prepare(R"(
+            INSERT INTO missions
+            (mission_id, drone_uri, region_id, mission_type, zone, route_id,
+             altitude, altitude_slot, delivery_lat, delivery_lon, exit_lat, exit_lon, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE');
+        )");
+
+        stmt.execute(mission_id, drone_uri, region_id, mission_type, zone, route_id,
+                     assigned_altitude, assigned_slot,
+                     delivery_lat, delivery_lon, exit_geo.lat, exit_geo.lon);
     }
 
     response["TYPE"] = "MISSION_APPROVED";
     response["MISSION_ID"] = mission_id;
     response["DRONE_URI"] = drone_uri;
+    response["COMMAND"] = "START_MISSION";
     response["MISSION_TYPE"] = mission_type;
     response["ZONE"] = zone;
     response["ROUTE_ID"] = route_id;
-    response["ROUTE_TYPE"] = route_type;
-    response["CONTOUR_LEVEL"] = contour_level;
-    response["CENTER_LAT"] = center_lat;
-    response["CENTER_LON"] = center_lon;
-    response["RADIUS_M"] = radius_m;
+    response["ROUTE_TYPE"] = route.route_type;
+    response["CONTOUR_LEVEL"] = route.contour_level;
+    response["CENTER_LAT"] = zone_info.center_lat;
+    response["CENTER_LON"] = zone_info.center_lon;
+    response["HALF_SIZE_M"] = route.half_size_m;
     response["ALTITUDE"] = assigned_altitude;
     response["ALTITUDE_SLOT"] = assigned_slot;
-    response["MAX_DRONES_ON_ROUTE"] = max_drones;
-    response["VERTICAL_SEPARATION"] = vertical_sep;
+    response["MAX_DRONES_ON_ROUTE"] = route.max_drones;
+    response["VERTICAL_SEPARATION_M"] = route.vertical_separation;
 
-    std::cout << "[CENTRAL] Misija odobrena: " << mission_id << " | " << zone << "/" << route_id << " | alt=" << assigned_altitude << " | slot=" << assigned_slot << std::endl;
+    if (mission_type == "DELIVERY")
+    {
+        response["DELIVERY_LAT"] = delivery_lat;
+        response["DELIVERY_LON"] = delivery_lon;
+        response["EXIT_LAT"] = exit_geo.lat;
+        response["EXIT_LON"] = exit_geo.lon;
+    }
+
+    std::cout << "[CENTRAL] Misija odobrena: " << mission_id
+              << " | type=" << mission_type
+              << " | " << zone << "/" << route_id
+              << " | slot=" << assigned_slot
+              << " | altitude=" << assigned_altitude << "m";
+
+    if (mission_type == "DELIVERY")
+    {
+        std::cout << " | exit=" << exit_geo.lat << "," << exit_geo.lon;
+    }
+
+    std::cout << std::endl;
 
     return response;
 }
 
-json process_message(const json& msg)
+class Session : public std::enable_shared_from_this<Session>
 {
-    json response;
-    std::string type = msg.value("TYPE", "UNKNOWN");
-
-    if (type == "REGION_REGISTER")
+public:
+    explicit Session(tcp::socket socket)
+        : socket_(std::move(socket))
     {
-        handle_region_register(msg);
-        response["TYPE"] = "ACK";
-        response["MESSAGE"] = "REGION_REGISTERED";
-    }
-    else if (type == "DRONE_STATUS")
-    {
-        handle_drone_status(msg);
-        response["TYPE"] = "ACK";
-        response["MESSAGE"] = "DRONE_STATUS_SAVED";
-    }
-    else if (type == "MISSION_REQUEST")
-    {
-        response = handle_mission_request(msg);
-    }
-    else if (type == "MISSION_FINISHED")
-    {
-        response = handle_mission_finished(msg);
-    }
-    else if (type == "ALARM")
-    {
-        response["TYPE"] = "ACK";
-        response["MESSAGE"] = "ALARM_RECEIVED";
-    }
-    else
-    {
-        response["TYPE"] = "ERROR";
-        response["MESSAGE"] = "UNKNOWN_TYPE";
     }
 
-    return response;
-}
-
-void regional_session(tcp::socket socket)
-{
-    try
+    void start()
     {
-        boost::asio::streambuf buffer;
+        read_message();
+    }
 
-        for (;;)
-        {
-            boost::system::error_code ec;
-            boost::asio::read_until(socket, buffer, "\n", ec);
-            if (ec) break;
+private:
+    void read_message()
+    {
+        auto self = shared_from_this();
 
-            std::istream is(&buffer);
-            std::string line;
-            std::getline(is, line);
-            if (line.empty()) continue;
-
-            json response;
-            try
+        boost::asio::async_read_until(socket_, buffer_, "\n",
+            [this, self](boost::system::error_code ec, std::size_t)
             {
-                json msg = json::parse(line);
-                response = process_message(msg);
+                if (!ec)
+                {
+                    std::istream is(&buffer_);
+                    std::string message;
+                    std::getline(is, message);
+
+                    if (!message.empty())
+                    {
+                        process_message(message);
+                    }
+
+                    read_message();
+                }
+                else
+                {
+                    std::cout << "[CENTRAL] Regionalni server prekinuo konekciju.\n";
+                }
+            });
+    }
+
+    void process_message(const std::string& message)
+    {
+        json response;
+
+        try
+        {
+            json msg = json::parse(message);
+            std::string type = msg.value("TYPE", "UNKNOWN");
+
+            if (type == "REGION_REGISTER")
+            {
+                handle_region_register(msg);
+                response["TYPE"] = "ACK";
+                response["MESSAGE"] = "REGION_REGISTERED";
             }
-            catch (const std::exception& e)
+            else if (type == "DRONE_STATUS")
+            {
+                handle_drone_status(msg);
+                response["TYPE"] = "ACK";
+                response["MESSAGE"] = "DRONE_STATUS_SAVED";
+            }
+            else if (type == "ALARM")
+            {
+                handle_alarm(msg);
+                response["TYPE"] = "ACK";
+                response["MESSAGE"] = "ALARM_SAVED";
+            }
+            else if (type == "MISSION_REQUEST")
+            {
+                response = handle_mission_request(msg);
+            }
+            else if (type == "MISSION_FINISHED")
+            {
+                response = handle_mission_finished(msg);
+            }
+            else
             {
                 response["TYPE"] = "ERROR";
-                response["MESSAGE"] = e.what();
+                response["MESSAGE"] = "UNKNOWN_MESSAGE_TYPE";
             }
-
-            std::string out = response.dump() + "\n";
-            boost::asio::write(socket, boost::asio::buffer(out));
         }
+        catch (const std::exception& e)
+        {
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = e.what();
+        }
+
+        send_message(response.dump() + "\n");
     }
-    catch (const std::exception& e)
+
+    void send_message(const std::string& message)
     {
-        std::cerr << "[CENTRAL] Session error: " << e.what() << std::endl;
+        auto self = shared_from_this();
+        auto out = std::make_shared<std::string>(message);
+
+        boost::asio::async_write(socket_, boost::asio::buffer(*out),
+            [this, self, out](boost::system::error_code ec, std::size_t)
+            {
+                if (ec)
+                {
+                    std::cerr << "[CENTRAL] Greška pri slanju odgovora: "
+                              << ec.message() << std::endl;
+                }
+            });
     }
-}
+
+private:
+    tcp::socket socket_;
+    boost::asio::streambuf buffer_;
+};
+
+class CentralServer
+{
+public:
+    CentralServer(boost::asio::io_context& io_context, short port)
+        : acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
+    {
+        accept_connection();
+    }
+
+private:
+    void accept_connection()
+    {
+        acceptor_.async_accept(
+            [this](boost::system::error_code ec, tcp::socket socket)
+            {
+                if (!ec)
+                {
+                    std::cout << "[CENTRAL] Regionalni server povezan.\n";
+                    std::make_shared<Session>(std::move(socket))->start();
+                }
+
+                accept_connection();
+            });
+    }
+
+private:
+    tcp::acceptor acceptor_;
+};
 
 int main(int argc, char* argv[])
 {
@@ -367,22 +863,22 @@ int main(int argc, char* argv[])
         g_db.reset(new sqlite::db("central_server.db"));
         init_database();
 
-        boost::asio::io_context io;
-        tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), std::atoi(argv[1])));
+        boost::asio::io_context io_context;
+        CentralServer server(io_context, std::atoi(argv[1]));
 
-        std::cout << "[CENTRAL] Listening on port " << argv[1] << std::endl;
+        std::cout << "[CENTRAL] Centralni server pokrenut na portu "
+                  << argv[1] << std::endl;
 
-        for (;;)
-        {
-            tcp::socket socket(io);
-            acceptor.accept(socket);
-            std::cout << "[CENTRAL] Regional connected.\n";
-            std::thread(regional_session, std::move(socket)).detach();
-        }
+        io_context.run();
+    }
+    catch (const sqlite::exception& e)
+    {
+        std::cerr << "[CENTRAL] SQLite greška: " << e.what() << std::endl;
+        return 1;
     }
     catch (const std::exception& e)
     {
-        std::cerr << "[CENTRAL] Error: " << e.what() << std::endl;
+        std::cerr << "[CENTRAL] Greška: " << e.what() << std::endl;
         return 1;
     }
 
