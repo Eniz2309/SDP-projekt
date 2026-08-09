@@ -151,7 +151,7 @@ private:
 
     void update_simulated_values()
     {
-        if (status_ == "ON_MISSION")
+        if (status_ == "ON_MISSION" || status_ == "FORMATION_MODE")
         {
             lat_ += 0.0001;
             lon_ += 0.0001;
@@ -278,6 +278,47 @@ private:
                 ack["DRONE_URI"] = drone_uri_;
                 ack["BASE_LAT"] = base_lat;
                 ack["BASE_LON"] = base_lon;
+                send_json(ack);
+            }
+            else if (type == "FORMATION_START")
+            {
+                std::string formation_id = msg.value("FORMATION_ID", "UNKNOWN_FORMATION");
+                std::string leader = msg.value("LEADER", "");
+                int spacing = msg.value("SPACING", 0);
+
+                altitude_ = msg.value("ALTITUDE", altitude_);
+                speed_ = msg.value("SPEED", speed_);
+                direction_ = msg.value("DIRECTION", direction_);
+                status_ = "FORMATION_MODE";
+
+                std::cout << "[DRONE] Entering formation "
+                          << formation_id
+                          << " | leader: " << leader
+                          << " | altitude: " << altitude_
+                          << " | speed: " << speed_
+                          << " | direction: " << direction_
+                          << " | spacing: " << spacing
+                          << std::endl;
+
+                json ack;
+                ack["TYPE"] = "ACK_FORMATION_START";
+                ack["DRONE_URI"] = drone_uri_;
+                ack["FORMATION_ID"] = formation_id;
+                send_json(ack);
+            }
+            else if (type == "FORMATION_STOP")
+            {
+                std::string formation_id = msg.value("FORMATION_ID", "UNKNOWN_FORMATION");
+
+                status_ = "IDLE";
+
+                std::cout << "[DRONE] Leaving formation "
+                          << formation_id << std::endl;
+
+                json ack;
+                ack["TYPE"] = "ACK_FORMATION_STOP";
+                ack["DRONE_URI"] = drone_uri_;
+                ack["FORMATION_ID"] = formation_id;
                 send_json(ack);
             }
             else if (type == "STOP_MISSION")

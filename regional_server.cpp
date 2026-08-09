@@ -11,6 +11,8 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <set>
 #include <sqlite3.h>
 #include "json/json.h"
 #include "sqlite3_wrapper.h"
@@ -30,6 +32,18 @@ boost::asio::io_context central_io;
 std::unique_ptr<tcp::socket> central_socket;
 std::mutex central_mutex;
 
+struct DroneConnection
+{
+    std::shared_ptr<tcp::socket> socket;
+    std::mutex write_mutex;
+    std::string drone_uri;
+};
+
+std::map<std::string, std::shared_ptr<DroneConnection>> active_drones;
+std::mutex drones_mutex;
+
+std::map<std::string, std::set<std::string>> formation_groups;
+std::mutex formation_mutex;
 
 
 std::vector<std::string> parse_zones(const std::string& zones_text)
@@ -207,7 +221,218 @@ json send_to_central(json msg)
     return json::parse(response);
 }
 
-json handle_drone_message(json msg)
+bool send_to_drone(const std::string& drone_uri, const json& msg)
+{
+    std::shared_ptr<DroneConnection> conn;
+
+    {
+        std::lock_guard<std::mutex> lock(drones_mutex);
+
+        auto it = active_drones.find(drone_uri);
+        if (it == active_drones.end())
+        {
+            std::cout << "[REGIONAL] Dron nije aktivan: "
+                      << drone_uri << std::endl;
+            return false;
+        }
+
+        conn = it->second;
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> write_lock(conn->write_mutex);
+
+        std::string out = msg.dump() + "\n";
+        boost::asio::write(*(conn->socket), boost::asio::buffer(out));
+
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[REGIONAL] Slanje dronu nije uspjelo: "
+                  << drone_uri << " | " << e.what() << std::endl;
+        return false;
+    }
+}
+
+void multicast_to_formation(const std::string& formation_id, const json& msg)
+{
+    std::set<std::string> drones;
+
+    {
+        std::lock_guard<std::mutex> lock(formation_mutex);
+
+        auto it = formation_groups.find(formation_id);
+        if (it == formation_groups.end())
+        {
+            std::cout << "[REGIONAL] Formacija ne postoji: "
+                      << formation_id << std::endl;
+            return;
+        }
+
+        drones = it->second;
+    }
+
+    int sent_count = 0;
+
+    for (const auto& drone_uri : drones)
+    {
+        bool ok = send_to_drone(drone_uri, msg);
+
+        if (ok)
+        {
+            sent_count++;
+            std::cout << "[REGIONAL] FORMATION multicast poslan dronu: "
+                      << drone_uri << std::endl;
+        }
+    }
+
+    std::cout << "[REGIONAL] Multicast formaciji " << formation_id
+              << " zavrsen. Poslano dronova: " << sent_count
+              << "/" << drones.size() << std::endl;
+}
+
+void remove_active_drone(std::shared_ptr<DroneConnection> conn)
+{
+    if (!conn || conn->drone_uri.empty())
+        return;
+
+    std::lock_guard<std::mutex> lock(drones_mutex);
+    active_drones.erase(conn->drone_uri);
+
+    std::cout << "[REGIONAL] Dron uklonjen iz aktivnih konekcija: "
+              << conn->drone_uri << std::endl;
+}
+
+void operator_console()
+{
+    std::string line;
+
+    std::cout << "[OPERATOR] Komande: list_drones | formation_create F1 DRON_001 DRON_002 | formation_start F1 DRON_001 120 15 EAST 30 | formation_stop F1\n";
+
+    while (true)
+    {
+        std::cout << "[OPERATOR] ";
+        std::getline(std::cin, line);
+
+        if (line.empty())
+            continue;
+
+        std::stringstream ss(line);
+        std::string command;
+        ss >> command;
+
+        if (command == "list_drones")
+        {
+            std::lock_guard<std::mutex> lock(drones_mutex);
+
+            std::cout << "[REGIONAL] Aktivni dronovi: ";
+            for (const auto& item : active_drones)
+            {
+                std::cout << item.first << " ";
+            }
+            std::cout << std::endl;
+        }
+        else if (command == "formation_create")
+        {
+            std::string formation_id;
+            ss >> formation_id;
+
+            if (formation_id.empty())
+            {
+                std::cout << "Format: formation_create FORMATION_1 DRON_001 DRON_002\n";
+                continue;
+            }
+
+            std::set<std::string> drones;
+            std::string drone_uri;
+
+            while (ss >> drone_uri)
+            {
+                drones.insert(drone_uri);
+            }
+
+            if (drones.empty())
+            {
+                std::cout << "[REGIONAL] Moras navesti barem jednog drona.\n";
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(formation_mutex);
+                formation_groups[formation_id] = drones;
+            }
+
+            std::cout << "[REGIONAL] Kreirana formacija "
+                      << formation_id
+                      << " sa "
+                      << drones.size()
+                      << " dronova.\n";
+        }
+        else if (command == "formation_start")
+        {
+            std::string formation_id;
+            std::string leader;
+            int altitude = 0;
+            int speed = 0;
+            std::string direction;
+            int spacing = 0;
+
+            ss >> formation_id >> leader >> altitude >> speed >> direction >> spacing;
+
+            if (formation_id.empty() || leader.empty() || direction.empty())
+            {
+                std::cout << "Format: formation_start FORMATION_1 DRON_001 120 15 EAST 30\n";
+                continue;
+            }
+
+            json msg;
+            msg["TYPE"] = "FORMATION_START";
+            msg["FORMATION_ID"] = formation_id;
+            msg["LEADER"] = leader;
+            msg["ALTITUDE"] = altitude;
+            msg["SPEED"] = speed;
+            msg["DIRECTION"] = direction;
+            msg["SPACING"] = spacing;
+
+            multicast_to_formation(formation_id, msg);
+
+            std::cout << "[REGIONAL] Formacijski let pokrenut: "
+                      << formation_id << std::endl;
+        }
+        else if (command == "formation_stop")
+        {
+            std::string formation_id;
+            ss >> formation_id;
+
+            if (formation_id.empty())
+            {
+                std::cout << "Format: formation_stop FORMATION_1\n";
+                continue;
+            }
+
+            json msg;
+            msg["TYPE"] = "FORMATION_STOP";
+            msg["FORMATION_ID"] = formation_id;
+
+            multicast_to_formation(formation_id, msg);
+
+            std::cout << "[REGIONAL] Formacijski let zaustavljen: "
+                      << formation_id << std::endl;
+        }
+        else
+        {
+            std::cout << "Nepoznata komanda. Dostupno:\n";
+            std::cout << "  list_drones\n";
+            std::cout << "  formation_create FORMATION_1 DRON_001 DRON_002\n";
+            std::cout << "  formation_start FORMATION_1 DRON_001 120 15 EAST 30\n";
+            std::cout << "  formation_stop FORMATION_1\n";
+        }
+    }
+}
+
+json handle_drone_message(json msg, std::shared_ptr<DroneConnection> conn)
 {
     std::string type = msg.value("TYPE", "UNKNOWN");
     json response;
@@ -215,6 +440,16 @@ json handle_drone_message(json msg)
     if (type == "REGISTER_REQ")
     {
         std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+
+        conn->drone_uri = drone_uri;
+
+        {
+            std::lock_guard<std::mutex> lock(drones_mutex);
+            active_drones[drone_uri] = conn;
+        }
+
+        std::cout << "[REGIONAL] Dron dodat u aktivne konekcije: "
+                  << drone_uri << std::endl;
 
         json status_msg;
         status_msg["TYPE"] = "DRONE_STATUS";
@@ -284,6 +519,14 @@ json handle_drone_message(json msg)
             response = send_to_central(msg);
         }
     }
+    else if (type == "ACK_FORMATION_START" || type == "ACK_FORMATION_STOP")
+    {
+        response["TYPE"] = "ACK";
+        response["MESSAGE"] = "FORMATION_ACK_RECEIVED";
+
+        std::cout << "[REGIONAL] ACK formacije od drona: "
+                  << msg.value("DRONE_URI", "UNKNOWN_DRONE") << std::endl;
+    }
     else
     {
         response["TYPE"] = "ERROR";
@@ -295,6 +538,9 @@ json handle_drone_message(json msg)
 
 void drone_session(tcp::socket socket)
 {
+    auto conn = std::make_shared<DroneConnection>();
+    conn->socket = std::make_shared<tcp::socket>(std::move(socket));
+
     try
     {
         boost::asio::streambuf buffer;
@@ -302,7 +548,7 @@ void drone_session(tcp::socket socket)
         for (;;)
         {
             boost::system::error_code ec;
-            boost::asio::read_until(socket, buffer, "\n", ec);
+            boost::asio::read_until(*(conn->socket), buffer, "\n", ec);
 
             if (ec)
             {
@@ -323,10 +569,14 @@ void drone_session(tcp::socket socket)
                       << line << std::endl;
 
             json msg = json::parse(line);
-            json response = handle_drone_message(msg);
+            json response = handle_drone_message(msg, conn);
 
             std::string out = response.dump() + "\n";
-            boost::asio::write(socket, boost::asio::buffer(out));
+
+            {
+                std::lock_guard<std::mutex> write_lock(conn->write_mutex);
+                boost::asio::write(*(conn->socket), boost::asio::buffer(out));
+            }
         }
     }
     catch (const sqlite::exception& e)
@@ -339,6 +589,8 @@ void drone_session(tcp::socket socket)
         std::cerr << "[REGIONAL] Drone session error: "
                   << e.what() << std::endl;
     }
+
+    remove_active_drone(conn);
 }
 
 void start_drone_server(unsigned short port)
@@ -414,6 +666,8 @@ int main(int argc, char* argv[])
         print_zones();
 
         connect_to_central(central_host, central_port);
+
+        std::thread(operator_console).detach();
 
         start_drone_server(drone_port);
     }
