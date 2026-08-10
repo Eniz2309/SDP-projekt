@@ -345,7 +345,7 @@ private:
 
     void update_simulated_values()
     {
-        const double MOVE_STEP = 0.00008;
+        const double MOVE_STEP = 0.00016;
 
         if (status_ == "ON_MISSION" && delivery_mode_)
         {
