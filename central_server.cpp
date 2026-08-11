@@ -6,6 +6,7 @@
 // - DELIVERY: izbor najbliže konture i izlazne tačke prema dostavnoj tački
 // - maksimalno 3 drona po istoj ruti, visinski slotovi po 2m
 // - čuvanje statusa dronova, misija i alarma u SQLite bazi
+// - LOW_BATTERY alarm automatski generiše RETURN_TO_BASE komandu
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -480,23 +481,92 @@ void handle_drone_status(const json& msg)
               << " | battery=" << battery << "%" << std::endl;
 }
 
-void handle_alarm(const json& msg)
+json handle_alarm(const json& msg)
 {
+    json response;
+
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
     std::string alarm_type = msg.value("ALARM_TYPE", "UNKNOWN_ALARM");
     std::string message = msg.value("MESSAGE", "");
 
-    std::lock_guard<std::mutex> lock(db_mutex);
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
 
-    auto stmt = g_db->prepare(R"(
-        INSERT INTO alarms(drone_uri, alarm_type, message)
-        VALUES (?, ?, ?);
-    )");
+        auto stmt = g_db->prepare(R"(
+            INSERT INTO alarms(drone_uri, alarm_type, message)
+            VALUES (?, ?, ?);
+        )");
 
-    stmt.execute(drone_uri, alarm_type, message);
+        stmt.execute(drone_uri, alarm_type, message);
+    }
 
     std::cout << "[CENTRAL] Alarm za " << drone_uri
               << " | " << alarm_type << std::endl;
+
+    if (alarm_type == "LOW_BATTERY")
+    {
+        double base_lat = 0.0;
+        double base_lon = 0.0;
+
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+
+            auto stmt_lat = g_db->prepare(R"(
+                SELECT base_lat
+                FROM regional_servers
+                WHERE region_id = ?;
+            )");
+
+            stmt_lat.execute(region_id);
+
+            if (!stmt_lat.fetch(base_lat))
+            {
+                response["TYPE"] = "ERROR";
+                response["MESSAGE"] = "BASE_NOT_FOUND_FOR_REGION";
+                return response;
+            }
+
+            auto stmt_lon = g_db->prepare(R"(
+                SELECT base_lon
+                FROM regional_servers
+                WHERE region_id = ?;
+            )");
+
+            stmt_lon.execute(region_id);
+            stmt_lon.fetch(base_lon);
+
+            // Dron prekida aktivnu misiju, pa se ruta i visinski slot oslobađaju.
+            auto mission_stmt = g_db->prepare(R"(
+                UPDATE missions
+                SET status = 'ABORTED_LOW_BATTERY',
+                    finished_at = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?
+                  AND status = 'ACTIVE';
+            )");
+
+            mission_stmt.execute(drone_uri);
+        }
+
+        response["TYPE"] = "RETURN_TO_BASE";
+        response["DRONE_URI"] = drone_uri;
+        response["BASE_LAT"] = base_lat;
+        response["BASE_LON"] = base_lon;
+        response["REASON"] = "LOW_BATTERY";
+
+        std::cout << "[CENTRAL] RETURN_TO_BASE komanda za "
+                  << drone_uri
+                  << " prema bazi "
+                  << base_lat << ", " << base_lon
+                  << std::endl;
+
+        return response;
+    }
+
+    response["TYPE"] = "ACK_ALARM";
+    response["MESSAGE"] = "ALARM_SAVED";
+
+    return response;
 }
 
 json handle_mission_finished(const json& msg)
@@ -773,9 +843,7 @@ private:
             }
             else if (type == "ALARM")
             {
-                handle_alarm(msg);
-                response["TYPE"] = "ACK";
-                response["MESSAGE"] = "ALARM_SAVED";
+                response = handle_alarm(msg);
             }
             else if (type == "MISSION_REQUEST")
             {
