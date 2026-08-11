@@ -2,6 +2,7 @@
 // Regionalni server za autonomne dronove.
 // Registruje zone na centralni server, prima dronove, čuva lokalni status,
 // validira zone i prosljeđuje zahtjeve centralnom serveru.
+// Ako centralni vrati RETURN_TO_BASE, regionalni komandu prosljeđuje dronu.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -316,8 +317,19 @@ json handle_drone_message(json msg)
 
         json central_response = send_to_central(msg);
 
-        response["TYPE"] = "ACK_ALARM";
-        response["CENTRAL_RESPONSE"] = central_response;
+        if (central_response.value("TYPE", "") == "RETURN_TO_BASE")
+        {
+            response = central_response;
+
+            std::cout << "[REGIONAL] Prosljeđujem RETURN_TO_BASE komandu dronu "
+                      << msg.value("DRONE_URI", "UNKNOWN_DRONE")
+                      << std::endl;
+        }
+        else
+        {
+            response["TYPE"] = "ACK_ALARM";
+            response["CENTRAL_RESPONSE"] = central_response;
+        }
     }
     else if (type == "MISSION_REQUEST")
     {
@@ -337,6 +349,25 @@ json handle_drone_message(json msg)
     else if (type == "MISSION_FINISHED")
     {
         response = send_to_central(msg);
+    }
+    else if (type == "ACK_RTB")
+    {
+        // Potvrda da je dron primio komandu za povratak u bazu.
+        json status_msg;
+        status_msg["TYPE"] = "DRONE_STATUS";
+        status_msg["DRONE_URI"] = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        status_msg["BATTERY"] = msg.value("BATTERY", -1);
+        status_msg["STATUS"] = "RETURN_TO_BASE";
+        status_msg["LAT"] = msg.value("BASE_LAT", 0.0);
+        status_msg["LON"] = msg.value("BASE_LON", 0.0);
+        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        status_msg["ROUTE_ID"] = "";
+
+        save_drone_status(status_msg);
+        json central_response = send_to_central(status_msg);
+
+        response["TYPE"] = "ACK_RTB_SAVED";
+        response["CENTRAL_RESPONSE"] = central_response;
     }
     else
     {

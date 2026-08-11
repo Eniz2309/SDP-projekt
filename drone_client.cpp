@@ -6,6 +6,7 @@
 // - misije: TEST_FLIGHT, MONITORING, DELIVERY
 // - DELIVERY: kretanje po kockastoj konturi do izlazne tačke, pa prilaz dostavnoj tački pod 90°
 // - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
+// - LOW_BATTERY alarm se šalje jednom i pokreće RETURN_TO_BASE
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -68,7 +69,8 @@ public:
           delivery_mode_(false),
           reached_exit_point_(false),
           package_delivered_(false),
-          mission_finished_sent_(false)
+          mission_finished_sent_(false),
+          low_battery_alarm_sent_(false)
     {
     }
 
@@ -210,9 +212,12 @@ private:
                         std::cout << "[DRONE] Battery decreased to "
                                   << battery_ << "%\n";
 
-                        if (battery_ <= 20 && status_ != "RETURN_TO_BASE")
+                        if (battery_ <= 20 &&
+                            status_ != "RETURN_TO_BASE" &&
+                            !low_battery_alarm_sent_)
                         {
                             send_low_battery_alarm();
+                            low_battery_alarm_sent_ = true;
                         }
                     }
 
@@ -345,7 +350,7 @@ private:
 
     void update_simulated_values()
     {
-        const double MOVE_STEP = 0.00016;
+        const double MOVE_STEP = 0.00008;
 
         if (status_ == "ON_MISSION" && delivery_mode_)
         {
@@ -536,17 +541,25 @@ private:
                 double base_lon = msg.value("BASE_LON", lon_);
 
                 status_ = "RETURN_TO_BASE";
+                active_route_id_ = "";
+                route_points_.clear();
+
+                // Demo verzija: dron se odmah vrati na bazne koordinate.
+                // Kasnije se može napraviti postepeni povratak pomoću move_towards().
                 lat_ = base_lat;
                 lon_ = base_lon;
 
-                std::cout << "[DRONE] Returning to base: "
-                          << base_lat << ", " << base_lon << std::endl;
+                std::cout << "[DRONE] Returning to base because of "
+                          << msg.value("REASON", "UNKNOWN_REASON")
+                          << ": " << base_lat << ", " << base_lon << std::endl;
 
                 json ack;
                 ack["TYPE"] = "ACK_RTB";
                 ack["DRONE_URI"] = drone_uri_;
                 ack["BASE_LAT"] = base_lat;
                 ack["BASE_LON"] = base_lon;
+                ack["BATTERY"] = battery_;
+                ack["ALTITUDE"] = altitude_;
                 send_json(ack);
             }
             else if (type == "STOP_MISSION")
@@ -681,6 +694,7 @@ private:
     bool reached_exit_point_;
     bool package_delivered_;
     bool mission_finished_sent_;
+    bool low_battery_alarm_sent_;
 };
 
 int main(int argc, char* argv[])
