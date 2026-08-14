@@ -1,6 +1,7 @@
 # SDP-projekt
 Repozitorij za projekt iz predmeta Softverski Dizajn Protokola - protokol za upravljanje sistemom autonomnih dronova
 
+Projekat se realizira na Elektrotehničkom fakultetu, Odsjek za Telekomunikacije, Univerzitet u Sarajevu.
 
 Projekat predstavlja implementaciju protokola za upravljanje autonomnim dronovima. Sistem se sastoji od centralnog servera, regionalnih servera i klijentskih aplikacija dronova.
 
