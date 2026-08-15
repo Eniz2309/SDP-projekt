@@ -1,3 +1,4 @@
+// v6_watchdog: drone client je isti kao v5; watchdog se izvrsava na regionalnom serveru.
 // drone_client.cpp
 // Klijent drona.
 // Funkcionalnosti:
