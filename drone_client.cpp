@@ -1,11 +1,12 @@
-// v6_watchdog: drone client je isti kao v5; watchdog se izvrsava na regionalnom serveru.
+// v7_inspection: dodana INSPECTION misija sa 4 kontrolne tacke i INSPECTION_REPORT porukama.
 // drone_client.cpp
 // Klijent drona.
 // Funkcionalnosti:
 // - registracija i autentifikacija
 // - TCP kontrolne poruke + UDP keepalive i telemetrija
-// - misije: TEST_FLIGHT, MONITORING, DELIVERY
-// - DELIVERY: kretanje po kockastoj konturi do izlazne tačke, pa prilaz dostavnoj tački pod 90°
+// - misije: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION
+// - DELIVERY: kretanje po kockastoj konturi do izlazne tacke, pa prilaz dostavnoj tacki pod 90°
+// - INSPECTION: obilazak 4 inspection tacke na konturi; za svaku se salje INSPECTION_REPORT
 // - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
 // - LOW_BATTERY alarm se šalje jednom i pokreće RETURN_TO_BASE
 // - prikazuje prioritet misije i eventualno preuzimanje slota od misije nižeg prioriteta
@@ -29,6 +30,12 @@ struct GeoPoint
 {
     double lat;
     double lon;
+};
+
+struct InspectionPoint
+{
+    std::string point_id;
+    GeoPoint position;
 };
 
 class DroneClient
@@ -73,6 +80,7 @@ public:
           direction_("NORTH"),
           status_("INIT"),
           current_waypoint_(0),
+          current_inspection_point_(0),
           delivery_mode_(false),
           reached_exit_point_(false),
           package_delivered_(false),
@@ -302,6 +310,24 @@ private:
                   << mission_id_ << std::endl;
     }
 
+    void send_inspection_report(const InspectionPoint& point)
+    {
+        json msg;
+        msg["TYPE"] = "INSPECTION_REPORT";
+        msg["MISSION_ID"] = mission_id_;
+        msg["DRONE_URI"] = drone_uri_;
+        msg["POINT_ID"] = point.point_id;
+        msg["LAT"] = point.position.lat;
+        msg["LON"] = point.position.lon;
+        msg["RESULT"] = "OK";
+
+        // INSPECTION_REPORT je kontrolna/izvjestajna poruka i ide pouzdano preko TCP-a.
+        send_json(msg);
+
+        std::cout << "[DRONE] Inspection " << point.point_id
+                  << " completed. RESULT=OK" << std::endl;
+    }
+
     GeoPoint offset_from_center(double center_lat, double center_lon,
                                 double north_m, double east_m)
     {
@@ -408,9 +434,40 @@ private:
             return;
         }
 
+        if (status_ == "ON_MISSION" && mission_type_ == "INSPECTION" && !inspection_points_.empty())
+        {
+            const InspectionPoint& inspection = inspection_points_[current_inspection_point_];
+
+            move_towards(inspection.position, MOVE_STEP);
+
+            if (distance_to_point(inspection.position) < MOVE_STEP)
+            {
+                // Fiksiraj koordinatu na inspection tacku radi jasnog izvjestaja.
+                lat_ = inspection.position.lat;
+                lon_ = inspection.position.lon;
+
+                send_inspection_report(inspection);
+                current_inspection_point_++;
+
+                if (current_inspection_point_ >= inspection_points_.size())
+                {
+                    std::cout << "[DRONE] All inspection points completed." << std::endl;
+                    finish_mission();
+                }
+                else
+                {
+                    std::cout << "[DRONE] Flying to inspection point "
+                              << inspection_points_[current_inspection_point_].point_id
+                              << "..." << std::endl;
+                }
+            }
+
+            return;
+        }
+
         if (status_ == "ON_MISSION" && !route_points_.empty())
         {
-            // Obično kretanje po kockastoj konturi.
+            // Obicno kretanje po kockastoj konturi.
             GeoPoint target = route_points_[current_waypoint_];
 
             move_towards(target, MOVE_STEP);
@@ -496,6 +553,8 @@ private:
 
                 route_points_ = generate_square_contour(center_lat, center_lon, half_size_m);
                 current_waypoint_ = 0;
+                current_inspection_point_ = 0;
+                inspection_points_.clear();
                 mission_finished_sent_ = false;
 
                 delivery_mode_ = false;
@@ -511,6 +570,33 @@ private:
 
                     delivery_point_.lat = msg.value("DELIVERY_LAT", lat_);
                     delivery_point_.lon = msg.value("DELIVERY_LON", lon_);
+                }
+                else if (mission_type_ == "INSPECTION")
+                {
+                    if (msg["INSPECTION_POINTS"].is_array())
+                    {
+                        for (const auto& item : msg["INSPECTION_POINTS"])
+                        {
+                            InspectionPoint point;
+                            point.point_id = item.value("POINT_ID", "UNKNOWN_POINT");
+                            point.position.lat = item.value("LAT", center_lat);
+                            point.position.lon = item.value("LON", center_lon);
+                            inspection_points_.push_back(point);
+                        }
+                    }
+
+                    // Sigurnosni fallback: ako server iz nekog razloga nije poslao listu,
+                    // koristi prva cetiri ugla vec generisane konture.
+                    if (inspection_points_.empty() && route_points_.size() >= 4)
+                    {
+                        for (std::size_t i = 0; i < 4; ++i)
+                        {
+                            InspectionPoint point;
+                            point.point_id = "I" + std::to_string(i + 1);
+                            point.position = route_points_[i];
+                            inspection_points_.push_back(point);
+                        }
+                    }
                 }
 
                 status_ = "ON_MISSION";
@@ -541,6 +627,24 @@ private:
                               << delivery_point_.lat << "," << delivery_point_.lon
                               << ")\n";
                 }
+                else if (mission_type_ == "INSPECTION")
+                {
+                    std::cout << "[DRONE] INSPECTION mission started. Points="
+                              << inspection_points_.size() << std::endl;
+
+                    for (const auto& point : inspection_points_)
+                    {
+                        std::cout << "  " << point.point_id << " -> "
+                                  << point.position.lat << "," << point.position.lon
+                                  << std::endl;
+                    }
+
+                    if (!inspection_points_.empty())
+                    {
+                        std::cout << "[DRONE] Flying to inspection point "
+                                  << inspection_points_[0].point_id << "..." << std::endl;
+                    }
+                }
             }
             else if (type == "MISSION_REJECTED")
             {
@@ -548,9 +652,19 @@ private:
                 std::cout << "[DRONE] Mission rejected: "
                           << msg.value("REASON", "UNKNOWN") << std::endl;
             }
+            else if (type == "ACK_INSPECTION_REPORT")
+            {
+                std::cout << "[DRONE] Central acknowledged inspection point "
+                          << msg.value("POINT_ID", "UNKNOWN_POINT") << ".\n";
+            }
             else if (type == "ACK_MISSION_FINISHED")
             {
                 std::cout << "[DRONE] Central acknowledged mission finish.\n";
+            }
+            else if (type == "MISSION_FINISH_REJECTED")
+            {
+                std::cerr << "[DRONE] Mission finish rejected: "
+                          << msg.value("REASON", "UNKNOWN") << std::endl;
             }
             else if (type == "CHANGE_PARAMS")
             {
@@ -564,6 +678,8 @@ private:
                 status_ = "RETURN_TO_BASE";
                 active_route_id_ = "";
                 route_points_.clear();
+                inspection_points_.clear();
+                current_inspection_point_ = 0;
 
                 // Demo verzija: dron se odmah vrati na bazne koordinate.
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
@@ -586,6 +702,8 @@ private:
             else if (type == "STOP_MISSION")
             {
                 status_ = "IDLE";
+                inspection_points_.clear();
+                current_inspection_point_ = 0;
                 std::cout << "[DRONE] Mission stopped.\n";
 
                 json ack;
@@ -729,6 +847,9 @@ private:
     std::vector<GeoPoint> route_points_;
     std::size_t current_waypoint_;
 
+    std::vector<InspectionPoint> inspection_points_;
+    std::size_t current_inspection_point_;
+
     bool delivery_mode_;
     GeoPoint exit_point_;
     GeoPoint delivery_point_;
@@ -748,6 +869,7 @@ int main(int argc, char* argv[])
 
         std::cerr << "Primjeri:\n";
         std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_INS abc123 SKENDERIJA INSPECTION SKENDERIJA_K2 120\n";
         std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_DEL abc123 SKENDERIJA DELIVERY AUTO 120 43.8580 18.4160\n";
         return 1;
     }
