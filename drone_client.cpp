@@ -2,11 +2,12 @@
 // Klijent drona.
 // Funkcionalnosti:
 // - registracija i autentifikacija
-// - keepalive i telemetrija
+// - TCP kontrolne poruke + UDP keepalive i telemetrija
 // - misije: TEST_FLIGHT, MONITORING, DELIVERY
 // - DELIVERY: kretanje po kockastoj konturi do izlazne tačke, pa prilaz dostavnoj tački pod 90°
 // - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
 // - LOW_BATTERY alarm se šalje jednom i pokreće RETURN_TO_BASE
+// - prikazuje prioritet misije i eventualno preuzimanje slota od misije nižeg prioriteta
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -20,6 +21,7 @@
 #include "json/json.h"
 
 using boost::asio::ip::tcp;
+using boost::asio::ip::udp;
 using json = nlohmann::json;
 
 struct GeoPoint
@@ -33,7 +35,8 @@ class DroneClient
 public:
     DroneClient(boost::asio::io_context& io,
                 const std::string& host,
-                const std::string& port,
+                const std::string& tcp_port,
+                const std::string& udp_port,
                 const std::string& drone_uri,
                 const std::string& token,
                 const std::string& zone,
@@ -45,11 +48,14 @@ public:
         : io_(io),
           socket_(io),
           resolver_(io),
+          udp_socket_(io, udp::v4()),
+          udp_resolver_(io),
           keepalive_timer_(io),
           telemetry_timer_(io),
           battery_timer_(io),
           host_(host),
-          port_(port),
+          port_(tcp_port),
+          udp_port_(udp_port),
           drone_uri_(drone_uri),
           token_(token),
           zone_(zone),
@@ -76,6 +82,10 @@ public:
 
     void start()
     {
+        // UDP endpoint se razrjesava jednom. UDP ne uspostavlja konekciju/handshake.
+        auto udp_endpoints = udp_resolver_.resolve(udp::v4(), host_, udp_port_);
+        udp_endpoint_ = *udp_endpoints.begin();
+
         auto endpoints = resolver_.resolve(host_, port_);
 
         boost::asio::async_connect(socket_, endpoints,
@@ -148,9 +158,9 @@ private:
         msg["ALTITUDE"] = altitude_;
         msg["ROUTE_ID"] = active_route_id_;
 
-        send_json(msg);
+        send_udp_json(msg);
 
-        std::cout << "[DRONE] KEEPALIVE sent. Battery="
+        std::cout << "[DRONE][UDP] KEEPALIVE sent. Battery="
                   << battery_ << "%\n";
     }
 
@@ -184,9 +194,9 @@ private:
         msg["DIRECTION"] = direction_;
         msg["ROUTE_ID"] = active_route_id_;
 
-        send_json(msg);
+        send_udp_json(msg);
 
-        std::cout << "[DRONE] TELEMETRY | "
+        std::cout << "[DRONE][UDP] TELEMETRY | "
                   << status_
                   << " | lat=" << lat_
                   << " lon=" << lon_
@@ -507,10 +517,20 @@ private:
                 std::cout << "[DRONE] Mission approved. "
                           << "type=" << mission_type_
                           << " route=" << active_route_id_
+                          << " priority=" << msg.value("MISSION_PRIORITY", 0)
                           << " half_size=" << half_size_m << "m"
                           << " altitude=" << altitude_
                           << " slot=" << msg.value("ALTITUDE_SLOT", -1)
                           << std::endl;
+
+                if (!msg.value("PREEMPTED_DRONE", "").empty())
+                {
+                    std::cout << "[DRONE] This mission preempted lower-priority drone "
+                              << msg.value("PREEMPTED_DRONE", "")
+                              << " mission="
+                              << msg.value("PREEMPTED_MISSION_ID", "")
+                              << std::endl;
+                }
 
                 if (mission_type_ == "DELIVERY")
                 {
@@ -615,6 +635,21 @@ private:
         std::cout << "[DRONE] New parameters applied.\n";
     }
 
+    // UDP: jedan JSON objekat = jedan datagram. Nema \n delimiter-a niti ACK-a.
+    void send_udp_json(const json& msg)
+    {
+        std::string data = msg.dump();
+
+        boost::system::error_code ec;
+        udp_socket_.send_to(boost::asio::buffer(data), udp_endpoint_, 0, ec);
+
+        if (ec)
+        {
+            std::cerr << "[DRONE] UDP send error: "
+                      << ec.message() << std::endl;
+        }
+    }
+
     void send_json(const json& msg)
     {
         std::string data = msg.dump() + "\n";
@@ -657,6 +692,10 @@ private:
     tcp::resolver resolver_;
     boost::asio::streambuf read_buffer_;
 
+    udp::socket udp_socket_;
+    udp::resolver udp_resolver_;
+    udp::endpoint udp_endpoint_;
+
     boost::asio::steady_timer keepalive_timer_;
     boost::asio::steady_timer telemetry_timer_;
     boost::asio::steady_timer battery_timer_;
@@ -664,7 +703,8 @@ private:
     std::deque<std::string> write_queue_;
 
     std::string host_;
-    std::string port_;
+    std::string port_;       // TCP port regionalnog servera
+    std::string udp_port_;   // UDP port za TELEMETRY/KEEPALIVE
     std::string drone_uri_;
     std::string token_;
 
@@ -699,34 +739,34 @@ private:
 
 int main(int argc, char* argv[])
 {
-    if (argc < 7 || argc > 11)
+    if (argc < 8 || argc > 12)
     {
-        std::cerr << "Usage: ./drone_client <regional_host> <regional_port> "
+        std::cerr << "Usage: ./drone_client <regional_host> <tcp_port> <udp_port> "
                   << "<drone_uri> <token> <zone> <mission_type> "
                   << "[route_id] [base_altitude] [delivery_lat] [delivery_lon]\n\n";
 
         std::cerr << "Primjeri:\n";
-        std::cerr << "./drone_client 127.0.0.1 8000 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
-        std::cerr << "./drone_client 127.0.0.1 8000 DRON_DEL abc123 SKENDERIJA DELIVERY AUTO 120 43.8580 18.4160\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_DEL abc123 SKENDERIJA DELIVERY AUTO 120 43.8580 18.4160\n";
         return 1;
     }
 
-    std::string route_id = (argc >= 8) ? argv[7] : "AUTO";
-    int base_altitude = (argc >= 9) ? std::atoi(argv[8]) : 120;
+    std::string route_id = (argc >= 9) ? argv[8] : "AUTO";
+    int base_altitude = (argc >= 10) ? std::atoi(argv[9]) : 120;
 
     double delivery_lat = 0.0;
     double delivery_lon = 0.0;
 
-    if (argc >= 11)
+    if (argc >= 12)
     {
-        delivery_lat = std::stod(argv[9]);
-        delivery_lon = std::stod(argv[10]);
+        delivery_lat = std::stod(argv[10]);
+        delivery_lon = std::stod(argv[11]);
     }
 
     boost::asio::io_context io;
 
-    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4],
-                      argv[5], argv[6], route_id, base_altitude,
+    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5],
+                      argv[6], argv[7], route_id, base_altitude,
                       delivery_lat, delivery_lon);
 
     drone.start();
