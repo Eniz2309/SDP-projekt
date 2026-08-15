@@ -1,8 +1,9 @@
 // regional_server.cpp
 // Regionalni server za autonomne dronove.
-// Registruje zone na centralni server, prima dronove, čuva lokalni status,
+// Registruje zone na centralni server, prima TCP kontrolne poruke i UDP telemetriju, čuva lokalni status,
 // validira zone i prosljeđuje zahtjeve centralnom serveru.
 // Ako centralni vrati RETURN_TO_BASE, regionalni komandu prosljeđuje dronu.
+// Ako centralni odobri misiju višeg prioriteta, regionalni ispiše koju je misiju preuzeo.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -13,12 +14,14 @@
 #include <cstdlib>
 #include <sstream>
 #include <vector>
+#include <array>
 
 #include <sqlite3.h>
 #include "json/json.h"
 #include "sqlite3_wrapper.h"
 
 using boost::asio::ip::tcp;
+using boost::asio::ip::udp;
 using json = nlohmann::json;
 namespace sqlite = sqlite3_wrapper;
 
@@ -344,6 +347,14 @@ json handle_drone_message(json msg)
         else
         {
             response = send_to_central(msg);
+
+            if (!response.value("PREEMPTED_DRONE", "").empty())
+            {
+                std::cout << "[REGIONAL] Centralni server je zbog prioriteta prekinuo misiju drona "
+                          << response.value("PREEMPTED_DRONE", "UNKNOWN_DRONE")
+                          << " i dodijelio slot novoj misiji."
+                          << std::endl;
+            }
         }
     }
     else if (type == "MISSION_FINISHED")
@@ -423,6 +434,71 @@ void drone_session(tcp::socket socket)
     }
 }
 
+// UDP listener za periodicke poruke drona.
+// Jedan UDP datagram sadrzi tacno jedan JSON objekat (TELEMETRY ili KEEPALIVE).
+void start_udp_server(unsigned short port)
+{
+    try
+    {
+        boost::asio::io_context io_context;
+        udp::socket socket(io_context, udp::endpoint(udp::v4(), port));
+
+        std::cout << "[REGIONAL] UDP telemetry/keepalive server slusa na portu "
+                  << port << std::endl;
+
+        for (;;)
+        {
+            std::array<char, 8192> data{};
+            udp::endpoint sender_endpoint;
+            boost::system::error_code ec;
+
+            std::size_t length = socket.receive_from(
+                boost::asio::buffer(data), sender_endpoint, 0, ec);
+
+            if (ec)
+            {
+                std::cerr << "[REGIONAL] UDP receive error: "
+                          << ec.message() << std::endl;
+                continue;
+            }
+
+            try
+            {
+                std::string received(data.data(), length);
+                json msg = json::parse(received);
+                std::string original_type = msg.value("TYPE", "UNKNOWN");
+
+                if (original_type != "KEEPALIVE" && original_type != "TELEMETRY")
+                {
+                    std::cerr << "[REGIONAL][UDP] Ignorisana poruka tipa "
+                              << original_type << std::endl;
+                    continue;
+                }
+
+                std::cout << "[REGIONAL][UDP] " << original_type
+                          << " od " << msg.value("DRONE_URI", "UNKNOWN_DRONE")
+                          << " | " << sender_endpoint.address().to_string()
+                          << ":" << sender_endpoint.port() << std::endl;
+
+                // Centralni vec ocekuje DRONE_STATUS format.
+                msg["TYPE"] = "DRONE_STATUS";
+                save_drone_status(msg);
+                send_to_central(msg);
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[REGIONAL] Invalid UDP message: "
+                          << e.what() << std::endl;
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[REGIONAL] UDP server error: "
+                  << e.what() << std::endl;
+    }
+}
+
 void start_drone_server(unsigned short port)
 {
     boost::asio::io_context io_context;
@@ -479,13 +555,13 @@ void connect_to_central(const std::string& host, const std::string& port)
 
 int main(int argc, char* argv[])
 {
-    if (argc != 8)
+    if (argc != 9)
     {
         std::cerr << "Usage: ./regional_server <region_id> <central_host> <central_port> "
-                  << "<drone_listen_port> <base_lat> <base_lon> <zones_config>\n\n";
+                  << "<drone_tcp_port> <drone_udp_port> <base_lat> <base_lon> <zones_config>\n\n";
 
         std::cerr << "Primjer:\n";
-        std::cerr << "./regional_server REGION_SARAJEVO 127.0.0.1 9000 8000 "
+        std::cerr << "./regional_server REGION_SARAJEVO 127.0.0.1 9000 8000 8001 "
                   << "43.8563 18.4131 "
                   << "SKENDERIJA:43.8563:18.4131:1000:4,BASCARSIJA:43.8590:18.4310:800:4\n";
         return 1;
@@ -494,10 +570,11 @@ int main(int argc, char* argv[])
     REGION_ID = argv[1];
     std::string central_host = argv[2];
     std::string central_port = argv[3];
-    unsigned short drone_port = static_cast<unsigned short>(std::atoi(argv[4]));
-    BASE_LAT = std::stod(argv[5]);
-    BASE_LON = std::stod(argv[6]);
-    ZONES = parse_zones_config(argv[7]);
+    unsigned short drone_tcp_port = static_cast<unsigned short>(std::atoi(argv[4]));
+    unsigned short drone_udp_port = static_cast<unsigned short>(std::atoi(argv[5]));
+    BASE_LAT = std::stod(argv[6]);
+    BASE_LON = std::stod(argv[7]);
+    ZONES = parse_zones_config(argv[8]);
 
     if (ZONES.empty())
     {
@@ -516,7 +593,11 @@ int main(int argc, char* argv[])
 
         connect_to_central(central_host, central_port);
 
-        start_drone_server(drone_port);
+        // UDP radi paralelno sa postojecim TCP listenerom.
+        std::thread udp_thread(start_udp_server, drone_udp_port);
+        udp_thread.detach();
+
+        start_drone_server(drone_tcp_port);
     }
     catch (const sqlite::exception& e)
     {
