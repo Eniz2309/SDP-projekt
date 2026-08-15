@@ -5,6 +5,7 @@
 // Ako centralni vrati RETURN_TO_BASE, regionalni komandu prosljeđuje dronu.
 // Ako centralni odobri misiju višeg prioriteta, regionalni ispiše koju je misiju preuzeo.
 // Watchdog detektuje gubitak telemetrije/keepalive-a nakon 45 s i prijavljuje CONNECTION_LOST.
+// INSPECTION_REPORT poruke prosljedjuje centralnom serveru preko TCP-a.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -493,6 +494,15 @@ json handle_drone_message(json msg)
                           << std::endl;
             }
         }
+    }
+    else if (type == "INSPECTION_REPORT")
+    {
+        std::cout << "[REGIONAL] INSPECTION_REPORT "
+                  << msg.value("POINT_ID", "UNKNOWN_POINT")
+                  << " od " << msg.value("DRONE_URI", "UNKNOWN_DRONE")
+                  << std::endl;
+
+        response = send_to_central(msg);
     }
     else if (type == "MISSION_FINISHED")
     {
