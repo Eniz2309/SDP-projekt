@@ -1,4 +1,5 @@
 // v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
+// v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
 // central_server.cpp
 // v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
 // Centralni server za autonomne dronove.
@@ -171,6 +172,20 @@ void init_database()
             status TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS inspection_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mission_id TEXT,
+            drone_uri TEXT,
+            point_id TEXT,
+            lat REAL,
+            lon REAL,
+            result TEXT,
+            received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(mission_id, point_id)
         );
     )");
 
@@ -705,6 +720,92 @@ json handle_alarm(const json& msg)
     return response;
 }
 
+json handle_inspection_report(const json& msg)
+{
+    json response;
+
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    std::string point_id = msg.value("POINT_ID", "");
+    double lat = msg.value("LAT", 0.0);
+    double lon = msg.value("LON", 0.0);
+    std::string result = msg.value("RESULT", "UNKNOWN");
+
+    if (mission_id.empty() || point_id.empty())
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_INSPECTION_REPORT_FIELDS";
+        return response;
+    }
+
+    if (point_id != "I1" && point_id != "I2" &&
+        point_id != "I3" && point_id != "I4")
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "INVALID_INSPECTION_POINT";
+        response["POINT_ID"] = point_id;
+        return response;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        std::string mission_type;
+        std::string mission_status;
+
+        auto type_stmt = g_db->prepare(R"(
+            SELECT mission_type
+            FROM missions
+            WHERE mission_id = ?;
+        )");
+        type_stmt.execute(mission_id);
+
+        if (!type_stmt.fetch(mission_type) || mission_type != "INSPECTION")
+        {
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = "MISSION_IS_NOT_INSPECTION";
+            return response;
+        }
+
+        auto status_stmt = g_db->prepare(R"(
+            SELECT status
+            FROM missions
+            WHERE mission_id = ?;
+        )");
+        status_stmt.execute(mission_id);
+        status_stmt.fetch(mission_status);
+
+        if (mission_status != "ACTIVE")
+        {
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = "INSPECTION_MISSION_NOT_ACTIVE";
+            return response;
+        }
+
+        auto report_stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO inspection_reports
+            (mission_id, drone_uri, point_id, lat, lon, result, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+        )");
+
+        report_stmt.execute(mission_id, drone_uri, point_id, lat, lon, result);
+    }
+
+    response["TYPE"] = "ACK_INSPECTION_REPORT";
+    response["MISSION_ID"] = mission_id;
+    response["DRONE_URI"] = drone_uri;
+    response["POINT_ID"] = point_id;
+    response["RESULT"] = result;
+
+    std::cout << "[CENTRAL] INSPECTION_REPORT: "
+              << mission_id << " | " << point_id
+              << " | result=" << result
+              << " | " << lat << "," << lon
+              << std::endl;
+
+    return response;
+}
+
 json handle_mission_finished(const json& msg)
 {
     json response;
@@ -722,6 +823,44 @@ json handle_mission_finished(const json& msg)
     {
         std::lock_guard<std::mutex> lock(db_mutex);
 
+        std::string mission_type;
+        auto type_stmt = g_db->prepare(R"(
+            SELECT mission_type
+            FROM missions
+            WHERE mission_id = ?;
+        )");
+        type_stmt.execute(mission_id);
+
+        if (!type_stmt.fetch(mission_type))
+        {
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = "MISSION_NOT_FOUND";
+            return response;
+        }
+
+        if (mission_type == "INSPECTION")
+        {
+            int completed_points = 0;
+            auto count_stmt = g_db->prepare(R"(
+                SELECT COUNT(*)
+                FROM inspection_reports
+                WHERE mission_id = ?
+                  AND result = 'OK';
+            )");
+            count_stmt.execute(mission_id);
+            count_stmt.fetch(completed_points);
+
+            if (completed_points < 4)
+            {
+                response["TYPE"] = "MISSION_FINISH_REJECTED";
+                response["MISSION_ID"] = mission_id;
+                response["REASON"] = "INSPECTION_POINTS_INCOMPLETE";
+                response["COMPLETED_POINTS"] = completed_points;
+                response["REQUIRED_POINTS"] = 4;
+                return response;
+            }
+        }
+
         auto stmt = g_db->prepare(R"(
             UPDATE missions
             SET status = 'FINISHED',
@@ -736,7 +875,7 @@ json handle_mission_finished(const json& msg)
     response["MISSION_ID"] = mission_id;
     response["DRONE_URI"] = drone_uri;
 
-    std::cout << "[CENTRAL] Misija završena: " << mission_id << std::endl;
+    std::cout << "[CENTRAL] Misija zavrsena: " << mission_id << std::endl;
 
     return response;
 }
@@ -934,6 +1073,31 @@ json handle_mission_request(const json& msg)
         response["EXIT_LAT"] = exit_geo.lat;
         response["EXIT_LON"] = exit_geo.lon;
     }
+    else if (mission_type == "INSPECTION")
+    {
+        // Cetiri inspection tacke su uglovi dodijeljene kvadratne konture.
+        // Redoslijed je I1 -> I2 -> I3 -> I4; dron nakon svake tacke salje INSPECTION_REPORT.
+        json points = json::array();
+
+        const double h = static_cast<double>(route.half_size_m);
+        const double north_offsets[4] = { h, h, -h, -h };
+        const double east_offsets[4]  = { -h, h, h, -h };
+
+        for (int i = 0; i < 4; ++i)
+        {
+            GeoPoint p = offset_to_latlon(zone_info.center_lat, zone_info.center_lon,
+                                          north_offsets[i], east_offsets[i]);
+
+            json point;
+            point["POINT_ID"] = "I" + std::to_string(i + 1);
+            point["LAT"] = p.lat;
+            point["LON"] = p.lon;
+            points.push_back(point);
+        }
+
+        response["INSPECTION_POINTS"] = points;
+        response["REQUIRED_INSPECTION_POINTS"] = 4;
+    }
 
     std::cout << "[CENTRAL] Misija odobrena: " << mission_id
               << " | type=" << mission_type
@@ -1027,6 +1191,10 @@ private:
             else if (type == "MISSION_REQUEST")
             {
                 response = handle_mission_request(msg);
+            }
+            else if (type == "INSPECTION_REPORT")
+            {
+                response = handle_inspection_report(msg);
             }
             else if (type == "MISSION_FINISHED")
             {
