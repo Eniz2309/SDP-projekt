@@ -6,6 +6,8 @@
 // Ako centralni odobri misiju višeg prioriteta, regionalni ispiše koju je misiju preuzeo.
 // Watchdog detektuje gubitak telemetrije/keepalive-a nakon 45 s i prijavljuje CONNECTION_LOST.
 // INSPECTION_REPORT poruke prosljedjuje centralnom serveru preko TCP-a.
+// v8_stop_mission: regionalni pamti aktivne TCP konekcije dronova po DRONE_URI i
+// aktivno salje STOP_MISSION preemptovanom dronu kada centralni odobri misiju viseg prioriteta.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -51,6 +53,84 @@ std::mutex db_mutex;
 boost::asio::io_context central_io;
 std::unique_ptr<tcp::socket> central_socket;
 std::mutex central_mutex;
+
+// Aktivne TCP konekcije dronova.
+// Svaki DRONE_URI se mapira na njegov socket, tako da regionalni server moze
+// naknadno poslati kontrolnu komandu (npr. STOP_MISSION) bas tom dronu.
+// write_mutex sprjecava da se dvije TCP poruke istovremeno upisuju na isti socket.
+struct DroneConnection
+{
+    std::shared_ptr<tcp::socket> socket;
+    std::mutex write_mutex;
+
+    explicit DroneConnection(const std::shared_ptr<tcp::socket>& s)
+        : socket(s)
+    {
+    }
+};
+
+std::mutex drone_connections_mutex;
+std::unordered_map<std::string, std::shared_ptr<DroneConnection>> drone_connections;
+
+void register_drone_connection(const std::string& drone_uri,
+                               const std::shared_ptr<DroneConnection>& connection)
+{
+    if (drone_uri.empty() || drone_uri == "UNKNOWN_DRONE")
+        return;
+
+    std::lock_guard<std::mutex> lock(drone_connections_mutex);
+    drone_connections[drone_uri] = connection;
+
+    std::cout << "[REGIONAL] TCP konekcija registrovana za "
+              << drone_uri << std::endl;
+}
+
+void unregister_drone_connection(const std::string& drone_uri,
+                                 const std::shared_ptr<DroneConnection>& connection)
+{
+    if (drone_uri.empty())
+        return;
+
+    std::lock_guard<std::mutex> lock(drone_connections_mutex);
+    auto it = drone_connections.find(drone_uri);
+
+    if (it != drone_connections.end() && it->second == connection)
+    {
+        drone_connections.erase(it);
+        std::cout << "[REGIONAL] TCP konekcija uklonjena za "
+                  << drone_uri << std::endl;
+    }
+}
+
+bool send_to_drone(const std::string& drone_uri, const json& msg)
+{
+    std::shared_ptr<DroneConnection> connection;
+
+    {
+        std::lock_guard<std::mutex> lock(drone_connections_mutex);
+        auto it = drone_connections.find(drone_uri);
+
+        if (it == drone_connections.end())
+            return false;
+
+        connection = it->second;
+    }
+
+    try
+    {
+        std::string out = msg.dump() + "\n";
+        std::lock_guard<std::mutex> write_lock(connection->write_mutex);
+        boost::asio::write(*connection->socket, boost::asio::buffer(out));
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[REGIONAL] Slanje komande dronu "
+                  << drone_uri << " nije uspjelo: "
+                  << e.what() << std::endl;
+        return false;
+    }
+}
 
 // Watchdog prati kada je posljednji put primljena poruka od svakog drona.
 // KEEPALIVE se salje svakih 15 s, pa je timeout namjerno postavljen na 45 s
@@ -488,10 +568,46 @@ json handle_drone_message(json msg)
 
             if (!response.value("PREEMPTED_DRONE", "").empty())
             {
+                std::string preempted_drone =
+                    response.value("PREEMPTED_DRONE", "UNKNOWN_DRONE");
+                std::string preempted_mission_id =
+                    response.value("PREEMPTED_MISSION_ID", "UNKNOWN_MISSION");
+
                 std::cout << "[REGIONAL] Centralni server je zbog prioriteta prekinuo misiju drona "
-                          << response.value("PREEMPTED_DRONE", "UNKNOWN_DRONE")
+                          << preempted_drone
                           << " i dodijelio slot novoj misiji."
                           << std::endl;
+
+                json stop_msg;
+                stop_msg["TYPE"] = "STOP_MISSION";
+                stop_msg["DRONE_URI"] = preempted_drone;
+                stop_msg["MISSION_ID"] = preempted_mission_id;
+                stop_msg["REASON"] = "PREEMPTED_BY_HIGHER_PRIORITY";
+                stop_msg["REPLACED_BY_MISSION_ID"] =
+                    response.value("MISSION_ID", "UNKNOWN_MISSION");
+
+                if (send_to_drone(preempted_drone, stop_msg))
+                {
+                    std::cout << "[REGIONAL] STOP_MISSION poslan dronu "
+                              << preempted_drone
+                              << " za misiju " << preempted_mission_id
+                              << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[REGIONAL] Preemptovani dron "
+                              << preempted_drone
+                              << " nema aktivnu TCP konekciju; STOP_MISSION nije isporucen."
+                              << std::endl;
+
+                    json alarm;
+                    alarm["TYPE"] = "ALARM";
+                    alarm["DRONE_URI"] = preempted_drone;
+                    alarm["ALARM_TYPE"] = "STOP_MISSION_DELIVERY_FAILED";
+                    alarm["MESSAGE"] = "No active TCP connection for preempted drone";
+                    alarm["MISSION_ID"] = preempted_mission_id;
+                    send_to_central(alarm);
+                }
             }
         }
     }
@@ -506,6 +622,27 @@ json handle_drone_message(json msg)
     }
     else if (type == "MISSION_FINISHED")
     {
+        response = send_to_central(msg);
+    }
+    else if (type == "ACK_STOP")
+    {
+        std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        std::string mission_id = msg.value("MISSION_ID", "UNKNOWN_MISSION");
+
+        std::cout << "[REGIONAL] ACK_STOP od " << drone_uri
+                  << " za misiju " << mission_id << std::endl;
+
+        json status_msg;
+        status_msg["TYPE"] = "DRONE_STATUS";
+        status_msg["DRONE_URI"] = drone_uri;
+        status_msg["BATTERY"] = msg.value("BATTERY", -1);
+        status_msg["STATUS"] = "IDLE";
+        status_msg["LAT"] = msg.value("LAT", 0.0);
+        status_msg["LON"] = msg.value("LON", 0.0);
+        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        status_msg["ROUTE_ID"] = "";
+        save_drone_status(status_msg);
+
         response = send_to_central(msg);
     }
     else if (type == "ACK_RTB")
@@ -536,8 +673,10 @@ json handle_drone_message(json msg)
     return response;
 }
 
-void drone_session(tcp::socket socket)
+void drone_session(const std::shared_ptr<DroneConnection>& connection)
 {
+    std::string registered_drone_uri;
+
     try
     {
         boost::asio::streambuf buffer;
@@ -545,11 +684,14 @@ void drone_session(tcp::socket socket)
         for (;;)
         {
             boost::system::error_code ec;
-            boost::asio::read_until(socket, buffer, "\n", ec);
+            boost::asio::read_until(*connection->socket, buffer, "\\n", ec);
 
             if (ec)
             {
-                std::cout << "[REGIONAL] Dron prekinuo konekciju.\n";
+                std::cout << "[REGIONAL] Dron prekinuo TCP konekciju";
+                if (!registered_drone_uri.empty())
+                    std::cout << ": " << registered_drone_uri;
+                std::cout << ".\\n";
                 break;
             }
 
@@ -563,10 +705,21 @@ void drone_session(tcp::socket socket)
             std::cout << "[REGIONAL] Poruka od drona: " << line << std::endl;
 
             json msg = json::parse(line);
+
+            if (msg.value("TYPE", "") == "REGISTER_REQ")
+            {
+                registered_drone_uri =
+                    msg.value("DRONE_URI", "UNKNOWN_DRONE");
+                register_drone_connection(registered_drone_uri, connection);
+            }
+
             json response = handle_drone_message(msg);
 
-            std::string out = response.dump() + "\n";
-            boost::asio::write(socket, boost::asio::buffer(out));
+            std::string out = response.dump() + "\\n";
+            {
+                std::lock_guard<std::mutex> write_lock(connection->write_mutex);
+                boost::asio::write(*connection->socket, boost::asio::buffer(out));
+            }
         }
     }
     catch (const sqlite::exception& e)
@@ -579,6 +732,8 @@ void drone_session(tcp::socket socket)
         std::cerr << "[REGIONAL] Drone session error: "
                   << e.what() << std::endl;
     }
+
+    unregister_drone_connection(registered_drone_uri, connection);
 }
 
 // UDP listener za periodicke poruke drona.
@@ -656,12 +811,13 @@ void start_drone_server(unsigned short port)
 
     for (;;)
     {
-        tcp::socket socket(io_context);
-        acceptor.accept(socket);
+        auto socket = std::make_shared<tcp::socket>(io_context);
+        acceptor.accept(*socket);
 
         std::cout << "[REGIONAL] Dron povezan na regionalni server.\n";
 
-        std::thread(drone_session, std::move(socket)).detach();
+        auto connection = std::make_shared<DroneConnection>(socket);
+        std::thread(drone_session, connection).detach();
     }
 }
 
