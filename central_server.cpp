@@ -1,3 +1,4 @@
+// v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
 // central_server.cpp
 // v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
 // Centralni server za autonomne dronove.
@@ -607,6 +608,37 @@ json handle_alarm(const json& msg)
 
     std::cout << "[CENTRAL] Alarm za " << drone_uri
               << " | " << alarm_type << std::endl;
+
+    if (alarm_type == "CONNECTION_LOST")
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto drone_stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'CONNECTION_LOST'
+            WHERE drone_uri = ?;
+        )");
+        drone_stmt.execute(drone_uri);
+
+        // Dron koji je izgubio vezu ne smije zadrzati aktivnu rutu/visinski slot.
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET status = 'ABORTED_CONNECTION_LOST',
+                finished_at = CURRENT_TIMESTAMP
+            WHERE drone_uri = ?
+              AND status = 'ACTIVE';
+        )");
+        mission_stmt.execute(drone_uri);
+
+        response["TYPE"] = "ACK_ALARM";
+        response["MESSAGE"] = "CONNECTION_LOST_SAVED";
+
+        std::cout << "[CENTRAL] Dron " << drone_uri
+                  << " oznacen kao CONNECTION_LOST; aktivna misija je prekinuta."
+                  << std::endl;
+
+        return response;
+    }
 
     if (alarm_type == "LOW_BATTERY")
     {
