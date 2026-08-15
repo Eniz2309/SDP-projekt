@@ -4,6 +4,7 @@
 // validira zone i prosljeđuje zahtjeve centralnom serveru.
 // Ako centralni vrati RETURN_TO_BASE, regionalni komandu prosljeđuje dronu.
 // Ako centralni odobri misiju višeg prioriteta, regionalni ispiše koju je misiju preuzeo.
+// Watchdog detektuje gubitak telemetrije/keepalive-a nakon 45 s i prijavljuje CONNECTION_LOST.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -15,6 +16,10 @@
 #include <sstream>
 #include <vector>
 #include <array>
+#include <chrono>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 #include <sqlite3.h>
 #include "json/json.h"
@@ -45,6 +50,33 @@ std::mutex db_mutex;
 boost::asio::io_context central_io;
 std::unique_ptr<tcp::socket> central_socket;
 std::mutex central_mutex;
+
+// Watchdog prati kada je posljednji put primljena poruka od svakog drona.
+// KEEPALIVE se salje svakih 15 s, pa je timeout namjerno postavljen na 45 s
+// (tri keepalive intervala) kako jedan ili dva izgubljena UDP datagrama ne bi
+// odmah proglasila dron nedostupnim.
+const int WATCHDOG_TIMEOUT_SECONDS = 45;
+const int WATCHDOG_CHECK_INTERVAL_SECONDS = 5;
+
+std::mutex watchdog_mutex;
+std::unordered_map<std::string, std::chrono::steady_clock::time_point> drone_last_seen;
+std::unordered_map<std::string, json> drone_last_status;
+std::unordered_set<std::string> connection_lost_reported;
+
+void mark_drone_seen(const json& msg)
+{
+    std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    if (drone_uri.empty() || drone_uri == "UNKNOWN_DRONE")
+        return;
+
+    std::lock_guard<std::mutex> lock(watchdog_mutex);
+    drone_last_seen[drone_uri] = std::chrono::steady_clock::now();
+    drone_last_status[drone_uri] = msg;
+
+    // Ako se dron ponovo javi nakon prekida veze, dozvoli novi watchdog alarm
+    // samo ako veza ponovo bude izgubljena u buducnosti.
+    connection_lost_reported.erase(drone_uri);
+}
 
 // Format zona:
 // SKENDERIJA:43.8563:18.4131:1000:4,BASCARSIJA:43.8590:18.4310:800:4
@@ -200,6 +232,8 @@ void save_drone_status(const json& msg)
     int altitude = msg.value("ALTITUDE", 0);
     std::string route_id = msg.value("ROUTE_ID", "");
 
+    mark_drone_seen(msg);
+
     std::lock_guard<std::mutex> lock(db_mutex);
 
     auto upsert_stmt = g_db->prepare(R"(
@@ -240,6 +274,109 @@ void save_alarm(const json& msg)
 
     std::cout << "[REGIONAL] Alarm: " << drone_uri
               << " | " << alarm_type << std::endl;
+}
+
+json send_to_central(json msg);
+
+void set_local_connection_lost(const std::string& drone_uri)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto stmt = g_db->prepare(R"(
+        UPDATE drones
+        SET status = 'CONNECTION_LOST'
+        WHERE drone_uri = ?;
+    )");
+
+    stmt.execute(drone_uri);
+}
+
+void watchdog_loop()
+{
+    std::cout << "[REGIONAL][WATCHDOG] Pokrenut. Timeout="
+              << WATCHDOG_TIMEOUT_SECONDS << "s, provjera svakih "
+              << WATCHDOG_CHECK_INTERVAL_SECONDS << "s." << std::endl;
+
+    for (;;)
+    {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(WATCHDOG_CHECK_INTERVAL_SECONDS));
+
+        std::vector<std::pair<std::string, json>> timed_out;
+        auto now = std::chrono::steady_clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(watchdog_mutex);
+
+            for (const auto& entry : drone_last_seen)
+            {
+                const std::string& drone_uri = entry.first;
+                long elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - entry.second).count();
+
+                if (elapsed >= WATCHDOG_TIMEOUT_SECONDS &&
+                    connection_lost_reported.find(drone_uri) == connection_lost_reported.end())
+                {
+                    connection_lost_reported.insert(drone_uri);
+
+                    json last_status;
+                    auto status_it = drone_last_status.find(drone_uri);
+                    if (status_it != drone_last_status.end())
+                        last_status = status_it->second;
+
+                    timed_out.push_back(std::make_pair(drone_uri, last_status));
+                }
+            }
+        }
+
+        for (const auto& lost : timed_out)
+        {
+            const std::string& drone_uri = lost.first;
+            json status_msg = lost.second;
+
+            std::cout << "[REGIONAL][WATCHDOG] CONNECTION_LOST: "
+                      << drone_uri << " nije poslao podatke najmanje "
+                      << WATCHDOG_TIMEOUT_SECONDS << " sekundi." << std::endl;
+
+            set_local_connection_lost(drone_uri);
+
+            // Centralnom prvo azuriraj stanje drona kako bi globalni registar
+            // odmah pokazao CONNECTION_LOST.
+            status_msg["TYPE"] = "DRONE_STATUS";
+            status_msg["DRONE_URI"] = drone_uri;
+            status_msg["STATUS"] = "CONNECTION_LOST";
+
+            try
+            {
+                send_to_central(status_msg);
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[REGIONAL][WATCHDOG] Ne mogu poslati DRONE_STATUS centralnom: "
+                          << e.what() << std::endl;
+            }
+
+            json alarm;
+            alarm["TYPE"] = "ALARM";
+            alarm["DRONE_URI"] = drone_uri;
+            alarm["ALARM_TYPE"] = "CONNECTION_LOST";
+            alarm["MESSAGE"] = "No telemetry or keepalive received for 45 seconds";
+
+            save_alarm(alarm);
+
+            try
+            {
+                json central_response = send_to_central(alarm);
+                std::cout << "[REGIONAL][WATCHDOG] Centralni odgovor: "
+                          << central_response.dump() << std::endl;
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[REGIONAL][WATCHDOG] Ne mogu poslati alarm centralnom: "
+                          << e.what() << std::endl;
+            }
+        }
+    }
 }
 
 json send_to_central(json msg)
@@ -596,6 +733,9 @@ int main(int argc, char* argv[])
         // UDP radi paralelno sa postojecim TCP listenerom.
         std::thread udp_thread(start_udp_server, drone_udp_port);
         udp_thread.detach();
+
+        std::thread watchdog_thread(watchdog_loop);
+        watchdog_thread.detach();
 
         start_drone_server(drone_tcp_port);
     }
