@@ -1,5 +1,6 @@
 // v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
 // v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
+// v8_stop_mission: prima ACK_STOP i potvrduje da je preemptovani dron stvarno zaustavio misiju.
 // central_server.cpp
 // v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
 // Centralni server za autonomne dronove.
@@ -720,6 +721,56 @@ json handle_alarm(const json& msg)
     return response;
 }
 
+json handle_ack_stop(const json& msg)
+{
+    json response;
+
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
+
+    if (mission_id.empty())
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_MISSION_ID_IN_ACK_STOP";
+        return response;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET status = 'PREEMPTED_STOP_CONFIRMED',
+                finished_at = CURRENT_TIMESTAMP
+            WHERE mission_id = ?
+              AND drone_uri = ?
+              AND status = 'PREEMPTED_BY_HIGHER_PRIORITY';
+        )");
+        mission_stmt.execute(mission_id, drone_uri);
+
+        auto drone_stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'IDLE',
+                route_id = '',
+                last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ?;
+        )");
+        drone_stmt.execute(drone_uri);
+    }
+
+    response["TYPE"] = "ACK_STOP_SAVED";
+    response["MISSION_ID"] = mission_id;
+    response["DRONE_URI"] = drone_uri;
+    response["REGION_ID"] = region_id;
+
+    std::cout << "[CENTRAL] ACK_STOP potvrden za dron "
+              << drone_uri << " | mission=" << mission_id
+              << std::endl;
+
+    return response;
+}
+
 json handle_inspection_report(const json& msg)
 {
     json response;
@@ -1195,6 +1246,10 @@ private:
             else if (type == "INSPECTION_REPORT")
             {
                 response = handle_inspection_report(msg);
+            }
+            else if (type == "ACK_STOP")
+            {
+                response = handle_ack_stop(msg);
             }
             else if (type == "MISSION_FINISHED")
             {
