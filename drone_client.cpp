@@ -10,6 +10,7 @@
 // - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
 // - LOW_BATTERY alarm se šalje jednom i pokreće RETURN_TO_BASE
 // - prikazuje prioritet misije i eventualno preuzimanje slota od misije nižeg prioriteta
+// - v8_stop_mission: prima STOP_MISSION, prekida lokalno izvrsavanje misije i salje ACK_STOP
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -701,14 +702,39 @@ private:
             }
             else if (type == "STOP_MISSION")
             {
+                std::string stopped_mission_id =
+                    msg.value("MISSION_ID", mission_id_);
+                std::string reason =
+                    msg.value("REASON", "UNKNOWN_REASON");
+
                 status_ = "IDLE";
+                active_route_id_.clear();
+                route_points_.clear();
+                current_waypoint_ = 0;
+
                 inspection_points_.clear();
                 current_inspection_point_ = 0;
-                std::cout << "[DRONE] Mission stopped.\n";
+
+                delivery_mode_ = false;
+                reached_exit_point_ = false;
+                package_delivered_ = false;
+
+                mission_finished_sent_ = true;
+
+                std::cout << "[DRONE] STOP_MISSION primljen. mission="
+                          << stopped_mission_id
+                          << " reason=" << reason << std::endl;
 
                 json ack;
                 ack["TYPE"] = "ACK_STOP";
                 ack["DRONE_URI"] = drone_uri_;
+                ack["MISSION_ID"] = stopped_mission_id;
+                ack["REASON"] = reason;
+                ack["STATUS"] = "IDLE";
+                ack["BATTERY"] = battery_;
+                ack["LAT"] = lat_;
+                ack["LON"] = lon_;
+                ack["ALTITUDE"] = altitude_;
                 send_json(ack);
             }
         }
