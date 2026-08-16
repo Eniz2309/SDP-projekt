@@ -2,6 +2,7 @@
 // v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
 // v9_scheduler: prioriteti se primjenjuju na RED CEKANJA ZADATAKA i raspolozivost dronova.
 // v10_formation: formacijski let koristi REGIONALNI SERVER kao VIRTUAL_LEADER/FORMATION_CONTROLLER.
+// v11_control_commands: operator moze poslati CHANGE_PARAMS i rucni RETURN_TO_BASE preko servera.
 // Svi clanovi formacije koriste isti visinski nivo, a razdvojeni su horizontalnim offsetima.
 // Dronovi se registruju kao AVAILABLE, centralni server dodjeljuje zadatke slobodnim dronovima.
 // Nema automatskog preemptiona zbog prioriteta; STOP_MISSION ostaje posebna kontrolna komanda.
@@ -1414,6 +1415,240 @@ json handle_drone_ready(const json& msg)
     return response;
 }
 
+json handle_change_params_request(const json& msg)
+{
+    json response;
+
+    std::string drone_uri = msg.value("DRONE_URI", "");
+    std::string request_region = msg.value("REGION_ID", "UNKNOWN_REGION");
+    int altitude = msg.value("ALTITUDE", -1);
+    int speed = msg.value("SPEED", -1);
+    std::string direction = msg.value("DIRECTION", "");
+
+    if (drone_uri.empty())
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_DRONE_URI";
+        return response;
+    }
+
+    if (altitude < 20 || altitude > 500 || speed < 0 || speed > 50 || direction.empty())
+    {
+        response["TYPE"] = "CONTROL_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "INVALID_FLIGHT_PARAMETERS";
+        return response;
+    }
+
+    std::string drone_region;
+    std::string drone_status;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto q = g_db->prepare("SELECT region_id FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        if (!q.fetch(drone_region))
+        {
+            response["TYPE"] = "CONTROL_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "DRONE_NOT_FOUND";
+            return response;
+        }
+
+        q = g_db->prepare("SELECT status FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(drone_status);
+    }
+
+    if (drone_region != request_region)
+    {
+        response["TYPE"] = "CONTROL_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_NOT_IN_THIS_REGION";
+        return response;
+    }
+
+    if (drone_status == "CONNECTION_LOST")
+    {
+        response["TYPE"] = "CONTROL_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_CONNECTION_LOST";
+        return response;
+    }
+
+    if (drone_status == "RETURN_TO_BASE")
+    {
+        response["TYPE"] = "CONTROL_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_RETURNING_TO_BASE";
+        return response;
+    }
+
+    json command;
+    command["TYPE"] = "CHANGE_PARAMS";
+    command["DRONE_URI"] = drone_uri;
+    command["ALTITUDE"] = altitude;
+    command["SPEED"] = speed;
+    command["DIRECTION"] = direction;
+    command["REASON"] = "OPERATOR_REQUEST";
+
+    response["TYPE"] = "CHANGE_PARAMS_DISPATCH";
+    response["TARGET_DRONE"] = drone_uri;
+    response["COMMAND"] = command;
+    response["REGION_ID"] = drone_region;
+
+    std::cout << "[CENTRAL][CONTROL] CHANGE_PARAMS za " << drone_uri
+              << " | altitude=" << altitude
+              << " speed=" << speed
+              << " direction=" << direction << std::endl;
+
+    return response;
+}
+
+json handle_manual_rtb_request(const json& msg)
+{
+    json response;
+
+    std::string drone_uri = msg.value("DRONE_URI", "");
+    std::string request_region = msg.value("REGION_ID", "UNKNOWN_REGION");
+
+    if (drone_uri.empty())
+    {
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_DRONE_URI";
+        return response;
+    }
+
+    std::string drone_region;
+    std::string drone_status;
+    double base_lat = 0.0;
+    double base_lon = 0.0;
+    std::string formation_mission;
+    std::string active_mission;
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto q = g_db->prepare("SELECT region_id FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        if (!q.fetch(drone_region))
+        {
+            response["TYPE"] = "RTB_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "DRONE_NOT_FOUND";
+            return response;
+        }
+
+        q = g_db->prepare("SELECT status FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(drone_status);
+
+        q = g_db->prepare("SELECT base_lat FROM regional_servers WHERE region_id = ?;");
+        q.execute(drone_region);
+        if (!q.fetch(base_lat))
+        {
+            response["TYPE"] = "RTB_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "BASE_NOT_FOUND_FOR_REGION";
+            return response;
+        }
+
+        q = g_db->prepare("SELECT base_lon FROM regional_servers WHERE region_id = ?;");
+        q.execute(drone_region);
+        q.fetch(base_lon);
+
+        // Ako je dron clan aktivne formacije, prvo treba zaustaviti cijelu formaciju.
+        q = g_db->prepare(R"(
+            SELECT fm.mission_id
+            FROM formation_members fm
+            JOIN missions m ON m.mission_id = fm.mission_id
+            WHERE fm.drone_uri = ?
+              AND fm.status = 'ACTIVE'
+              AND m.status IN ('ACTIVE', 'STOP_REQUESTED')
+            LIMIT 1;
+        )");
+        q.execute(drone_uri);
+        q.fetch(formation_mission);
+
+        q = g_db->prepare(R"(
+            SELECT mission_id
+            FROM missions
+            WHERE drone_uri = ? AND status = 'ACTIVE'
+            LIMIT 1;
+        )");
+        q.execute(drone_uri);
+        q.fetch(active_mission);
+    }
+
+    if (drone_region != request_region)
+    {
+        response["TYPE"] = "RTB_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_NOT_IN_THIS_REGION";
+        return response;
+    }
+
+    if (drone_status == "CONNECTION_LOST")
+    {
+        response["TYPE"] = "RTB_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_CONNECTION_LOST";
+        return response;
+    }
+
+    if (!formation_mission.empty())
+    {
+        response["TYPE"] = "RTB_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_IN_ACTIVE_FORMATION_STOP_FORMATION_FIRST";
+        response["FORMATION_MISSION_ID"] = formation_mission;
+        return response;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        if (!active_mission.empty())
+        {
+            auto m = g_db->prepare(R"(
+                UPDATE missions
+                SET status = 'ABORTED_MANUAL_RTB', finished_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND status = 'ACTIVE';
+            )");
+            m.execute(active_mission);
+        }
+
+        auto d = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'RETURN_TO_BASE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ?;
+        )");
+        d.execute(drone_uri);
+    }
+
+    json command;
+    command["TYPE"] = "RETURN_TO_BASE";
+    command["DRONE_URI"] = drone_uri;
+    command["BASE_LAT"] = base_lat;
+    command["BASE_LON"] = base_lon;
+    command["REASON"] = "MANUAL_OPERATOR_REQUEST";
+
+    response["TYPE"] = "RETURN_TO_BASE_DISPATCH";
+    response["TARGET_DRONE"] = drone_uri;
+    response["COMMAND"] = command;
+    response["REGION_ID"] = drone_region;
+    response["ABORTED_MISSION_ID"] = active_mission;
+    response["ASSIGNMENTS"] = schedule_region(drone_region);
+
+    std::cout << "[CENTRAL][CONTROL] MANUAL RTB za " << drone_uri
+              << " -> " << base_lat << ", " << base_lon;
+    if (!active_mission.empty())
+        std::cout << " | aborted mission=" << active_mission;
+    std::cout << std::endl;
+
+    return response;
+}
+
 json handle_mission_submit(const json& msg)
 {
     json response;
@@ -1692,6 +1927,14 @@ private:
             else if (type == "MISSION_SUBMIT" || type == "MISSION_REQUEST")
             {
                 response = handle_mission_submit(msg);
+            }
+            else if (type == "CONTROL_PARAMS_REQUEST")
+            {
+                response = handle_change_params_request(msg);
+            }
+            else if (type == "MANUAL_RTB_REQUEST")
+            {
+                response = handle_manual_rtb_request(msg);
             }
             else if (type == "STOP_MISSION_REQUEST")
             {
