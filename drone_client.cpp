@@ -1,16 +1,8 @@
-// v7_inspection: dodana INSPECTION misija sa 4 kontrolne tacke i INSPECTION_REPORT porukama.
 // drone_client.cpp
-// Klijent drona.
-// Funkcionalnosti:
-// - registracija i autentifikacija
-// - TCP kontrolne poruke + UDP keepalive i telemetrija
-// - misije: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION
-// - DELIVERY: kretanje po kockastoj konturi do izlazne tacke, pa prilaz dostavnoj tacki pod 90°
-// - INSPECTION: obilazak 4 inspection tacke na konturi; za svaku se salje INSPECTION_REPORT
-// - baterija: 1% traje 2 minute, tj. baterija se smanjuje za 1 svakih 120 sekundi dok je dron aktivan
-// - LOW_BATTERY alarm se šalje jednom i pokreće RETURN_TO_BASE
-// - prikazuje prioritet misije i eventualno preuzimanje slota od misije nižeg prioriteta
-// - v8_stop_mission: prima STOP_MISSION, prekida lokalno izvrsavanje misije i salje ACK_STOP
+// v9_scheduler: dron vise ne bira vlastitu misiju.
+// Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
+// TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
+// Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, RTB i STOP_MISSION.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -48,12 +40,7 @@ public:
                 const std::string& udp_port,
                 const std::string& drone_uri,
                 const std::string& token,
-                const std::string& zone,
-                const std::string& mission_type,
-                const std::string& route_id,
-                int base_altitude,
-                double delivery_lat,
-                double delivery_lon)
+                int base_altitude)
         : io_(io),
           socket_(io),
           resolver_(io),
@@ -67,12 +54,13 @@ public:
           udp_port_(udp_port),
           drone_uri_(drone_uri),
           token_(token),
-          zone_(zone),
-          mission_type_(mission_type),
-          route_id_(route_id),
-          mission_id_(drone_uri + "_M001"),
-          delivery_lat_(delivery_lat),
-          delivery_lon_(delivery_lon),
+          zone_(""),
+          mission_type_(""),
+          route_id_("AUTO"),
+          active_route_id_(""),
+          mission_id_(""),
+          delivery_lat_(0.0),
+          delivery_lon_(0.0),
           battery_(100),
           lat_(43.8563),
           lon_(18.4131),
@@ -225,7 +213,8 @@ private:
             {
                 if (!ec)
                 {
-                    if (status_ != "IDLE" && status_ != "REGISTERED" && battery_ > 0)
+                    if (status_ != "AVAILABLE" && status_ != "IDLE" &&
+                        status_ != "REGISTERED" && battery_ > 0)
                     {
                         battery_ -= 1;
 
@@ -259,37 +248,20 @@ private:
         std::cout << "[DRONE] LOW_BATTERY alarm sent.\n";
     }
 
-    void send_mission_request()
+    void send_drone_ready()
     {
         json msg;
-        msg["TYPE"] = "MISSION_REQUEST";
-        msg["MISSION_ID"] = mission_id_;
-        msg["MISSION_TYPE"] = mission_type_;
+        msg["TYPE"] = "DRONE_READY";
         msg["DRONE_URI"] = drone_uri_;
-        msg["ZONE"] = zone_;
-        msg["ROUTE_ID"] = route_id_;
+        msg["BATTERY"] = battery_;
+        msg["STATUS"] = "AVAILABLE";
+        msg["LAT"] = lat_;
+        msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
-
-        if (mission_type_ == "DELIVERY")
-        {
-            msg["DELIVERY_LAT"] = delivery_lat_;
-            msg["DELIVERY_LON"] = delivery_lon_;
-        }
-
+        msg["ROUTE_ID"] = "";
         send_json(msg);
 
-        std::cout << "[DRONE] Mission request sent: "
-                  << mission_type_
-                  << " | zone=" << zone_
-                  << " | route=" << route_id_;
-
-        if (mission_type_ == "DELIVERY")
-        {
-            std::cout << " | delivery=" << delivery_lat_
-                      << "," << delivery_lon_;
-        }
-
-        std::cout << std::endl;
+        std::cout << "[DRONE] Ready for assignment. STATUS=AVAILABLE" << std::endl;
     }
 
     void finish_mission()
@@ -298,7 +270,8 @@ private:
             return;
 
         mission_finished_sent_ = true;
-        status_ = "IDLE";
+        status_ = "AVAILABLE";
+        active_route_id_.clear();
 
         json msg;
         msg["TYPE"] = "MISSION_FINISHED";
@@ -531,17 +504,22 @@ private:
             }
             else if (type == "AUTH_ACK")
             {
-                status_ = "IDLE";
+                status_ = "AVAILABLE";
 
-                std::cout << "[DRONE] Authenticated. Starting timers.\n";
+                std::cout << "[DRONE] Authenticated. Starting timers and waiting for assignment.\n";
 
                 start_keepalive();
                 start_telemetry();
                 start_battery_timer();
 
-                send_mission_request();
+                send_drone_ready();
             }
-            else if (type == "MISSION_APPROVED")
+            else if (type == "ACK_DRONE_READY")
+            {
+                status_ = "AVAILABLE";
+                std::cout << "[DRONE] Central confirms AVAILABLE state.\n";
+            }
+            else if (type == "START_MISSION" || type == "MISSION_APPROVED")
             {
                 mission_id_ = msg.value("MISSION_ID", mission_id_);
                 mission_type_ = msg.value("MISSION_TYPE", mission_type_);
@@ -602,7 +580,7 @@ private:
 
                 status_ = "ON_MISSION";
 
-                std::cout << "[DRONE] Mission approved. "
+                std::cout << "[DRONE] Mission assigned by central server. "
                           << "type=" << mission_type_
                           << " route=" << active_route_id_
                           << " priority=" << msg.value("MISSION_PRIORITY", 0)
@@ -610,15 +588,6 @@ private:
                           << " altitude=" << altitude_
                           << " slot=" << msg.value("ALTITUDE_SLOT", -1)
                           << std::endl;
-
-                if (!msg.value("PREEMPTED_DRONE", "").empty())
-                {
-                    std::cout << "[DRONE] This mission preempted lower-priority drone "
-                              << msg.value("PREEMPTED_DRONE", "")
-                              << " mission="
-                              << msg.value("PREEMPTED_MISSION_ID", "")
-                              << std::endl;
-                }
 
                 if (mission_type_ == "DELIVERY")
                 {
@@ -649,7 +618,7 @@ private:
             }
             else if (type == "MISSION_REJECTED")
             {
-                status_ = "IDLE";
+                status_ = "AVAILABLE";
                 std::cout << "[DRONE] Mission rejected: "
                           << msg.value("REASON", "UNKNOWN") << std::endl;
             }
@@ -707,7 +676,7 @@ private:
                 std::string reason =
                     msg.value("REASON", "UNKNOWN_REASON");
 
-                status_ = "IDLE";
+                status_ = "AVAILABLE";
                 active_route_id_.clear();
                 route_points_.clear();
                 current_waypoint_ = 0;
@@ -730,7 +699,7 @@ private:
                 ack["DRONE_URI"] = drone_uri_;
                 ack["MISSION_ID"] = stopped_mission_id;
                 ack["REASON"] = reason;
-                ack["STATUS"] = "IDLE";
+                ack["STATUS"] = "AVAILABLE";
                 ack["BATTERY"] = battery_;
                 ack["LAT"] = lat_;
                 ack["LON"] = lon_;
@@ -887,40 +856,20 @@ private:
 
 int main(int argc, char* argv[])
 {
-    if (argc < 8 || argc > 12)
+    if (argc < 6 || argc > 7)
     {
         std::cerr << "Usage: ./drone_client <regional_host> <tcp_port> <udp_port> "
-                  << "<drone_uri> <token> <zone> <mission_type> "
-                  << "[route_id] [base_altitude] [delivery_lat] [delivery_lon]\n\n";
-
-        std::cerr << "Primjeri:\n";
-        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 SKENDERIJA MONITORING SKENDERIJA_K2 120\n";
-        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_INS abc123 SKENDERIJA INSPECTION SKENDERIJA_K2 120\n";
-        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_DEL abc123 SKENDERIJA DELIVERY AUTO 120 43.8580 18.4160\n";
+                  << "<drone_uri> <token> [base_altitude]\n\n";
+        std::cerr << "Primjer:\n";
+        std::cerr << "./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 120\n";
         return 1;
     }
 
-    std::string route_id = (argc >= 9) ? argv[8] : "AUTO";
-    int base_altitude = (argc >= 10) ? std::atoi(argv[9]) : 120;
-
-    double delivery_lat = 0.0;
-    double delivery_lon = 0.0;
-
-    if (argc >= 12)
-    {
-        delivery_lat = std::stod(argv[10]);
-        delivery_lon = std::stod(argv[11]);
-    }
+    int base_altitude = (argc >= 7) ? std::atoi(argv[6]) : 120;
 
     boost::asio::io_context io;
-
-    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5],
-                      argv[6], argv[7], route_id, base_altitude,
-                      delivery_lat, delivery_lon);
-
+    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5], base_altitude);
     drone.start();
-
     io.run();
-
     return 0;
 }
