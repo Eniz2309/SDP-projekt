@@ -1,6 +1,8 @@
 // v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
 // v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
-// v8_stop_mission: prima ACK_STOP i potvrduje da je preemptovani dron stvarno zaustavio misiju.
+// v9_scheduler: prioriteti se primjenjuju na RED CEKANJA ZADATAKA i raspolozivost dronova.
+// Dronovi se registruju kao AVAILABLE, centralni server dodjeljuje zadatke slobodnim dronovima.
+// Nema automatskog preemptiona zbog prioriteta; STOP_MISSION ostaje posebna kontrolna komanda.
 // central_server.cpp
 // v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
 // Centralni server za autonomne dronove.
@@ -11,7 +13,8 @@
 // - maksimalno 3 drona po istoj ruti, visinski slotovi po 2m
 // - čuvanje statusa dronova, misija i alarma u SQLite bazi
 // - LOW_BATTERY alarm automatski generiše RETURN_TO_BASE komandu
-// - prioriteti misija i preuzimanje slota od misije nižeg prioriteta
+// - prioritetni red zadataka (MONITORING > DELIVERY > INSPECTION > TEST_FLIGHT)
+// - dodjela zadataka slobodnim dronovima; rute i kapacitet su odvojena logika
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -33,6 +36,7 @@ namespace sqlite = sqlite3_wrapper;
 
 std::unique_ptr<sqlite::db> g_db;
 std::mutex db_mutex;
+std::mutex scheduler_mutex;
 
 const int DEFAULT_MAX_DRONES_PER_ROUTE = 3;
 const int DEFAULT_VERTICAL_SEPARATION_M = 2;
@@ -80,23 +84,6 @@ struct RouteInfo
     }
 };
 
-struct PreemptedMission
-{
-    bool found;
-    std::string mission_id;
-    std::string drone_uri;
-    int mission_priority;
-    int altitude_slot;
-    int altitude;
-
-    PreemptedMission()
-        : found(false),
-          mission_priority(0),
-          altitude_slot(-1),
-          altitude(0)
-    {
-    }
-};
 
 void exec_sql(const std::string& sql)
 {
@@ -295,70 +282,9 @@ int get_mission_priority(const std::string& mission_type)
     return 0;
 }
 
-PreemptedMission find_lowest_priority_active_mission(const std::string& region_id,
-                                                     const std::string& zone,
-                                                     const std::string& route_id)
-{
-    PreemptedMission result;
 
-    std::lock_guard<std::mutex> lock(db_mutex);
+json schedule_region(const std::string& region_id);
 
-    auto stmt = g_db->prepare(R"(
-        SELECT mission_id
-        FROM missions
-        WHERE status = 'ACTIVE'
-          AND region_id = ?
-          AND zone = ?
-          AND route_id = ?
-        ORDER BY mission_priority ASC, created_at ASC
-        LIMIT 1;
-    )");
-
-    stmt.execute(region_id, zone, route_id);
-
-    if (!stmt.fetch(result.mission_id))
-    {
-        return result;
-    }
-
-    auto s_drone = g_db->prepare("SELECT drone_uri FROM missions WHERE mission_id = ?;");
-    s_drone.execute(result.mission_id);
-    s_drone.fetch(result.drone_uri);
-
-    auto s_priority = g_db->prepare("SELECT mission_priority FROM missions WHERE mission_id = ?;");
-    s_priority.execute(result.mission_id);
-    s_priority.fetch(result.mission_priority);
-
-    auto s_slot = g_db->prepare("SELECT altitude_slot FROM missions WHERE mission_id = ?;");
-    s_slot.execute(result.mission_id);
-    s_slot.fetch(result.altitude_slot);
-
-    auto s_alt = g_db->prepare("SELECT altitude FROM missions WHERE mission_id = ?;");
-    s_alt.execute(result.mission_id);
-    s_alt.fetch(result.altitude);
-
-    result.found = true;
-    return result;
-}
-
-void mark_mission_preempted(const std::string& old_mission_id,
-                            const std::string& new_mission_id)
-{
-    std::lock_guard<std::mutex> lock(db_mutex);
-
-    auto stmt = g_db->prepare(R"(
-        UPDATE missions
-        SET status = 'PREEMPTED_BY_HIGHER_PRIORITY',
-            finished_at = CURRENT_TIMESTAMP
-        WHERE mission_id = ?;
-    )");
-
-    stmt.execute(old_mission_id);
-
-    std::cout << "[CENTRAL] Misija " << old_mission_id
-              << " prekinuta zbog misije višeg prioriteta "
-              << new_mission_id << std::endl;
-}
 
 bool zone_exists(const std::string& region_id, const std::string& zone)
 {
@@ -741,17 +667,17 @@ json handle_ack_stop(const json& msg)
 
         auto mission_stmt = g_db->prepare(R"(
             UPDATE missions
-            SET status = 'PREEMPTED_STOP_CONFIRMED',
+            SET status = 'STOPPED',
                 finished_at = CURRENT_TIMESTAMP
             WHERE mission_id = ?
               AND drone_uri = ?
-              AND status = 'PREEMPTED_BY_HIGHER_PRIORITY';
+              AND status IN ('ACTIVE', 'STOP_REQUESTED');
         )");
         mission_stmt.execute(mission_id, drone_uri);
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'IDLE',
+            SET status = 'AVAILABLE',
                 route_id = '',
                 last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
@@ -763,10 +689,11 @@ json handle_ack_stop(const json& msg)
     response["MISSION_ID"] = mission_id;
     response["DRONE_URI"] = drone_uri;
     response["REGION_ID"] = region_id;
+    response["ASSIGNMENTS"] = schedule_region(region_id);
 
     std::cout << "[CENTRAL] ACK_STOP potvrden za dron "
               << drone_uri << " | mission=" << mission_id
-              << std::endl;
+              << "; dron je ponovo AVAILABLE." << std::endl;
 
     return response;
 }
@@ -863,6 +790,7 @@ json handle_mission_finished(const json& msg)
 
     std::string mission_id = msg.value("MISSION_ID", "");
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+    std::string region_id;
 
     if (mission_id.empty())
     {
@@ -876,9 +804,7 @@ json handle_mission_finished(const json& msg)
 
         std::string mission_type;
         auto type_stmt = g_db->prepare(R"(
-            SELECT mission_type
-            FROM missions
-            WHERE mission_id = ?;
+            SELECT mission_type FROM missions WHERE mission_id = ?;
         )");
         type_stmt.execute(mission_id);
 
@@ -889,14 +815,18 @@ json handle_mission_finished(const json& msg)
             return response;
         }
 
+        auto region_stmt = g_db->prepare(R"(
+            SELECT region_id FROM missions WHERE mission_id = ?;
+        )");
+        region_stmt.execute(mission_id);
+        region_stmt.fetch(region_id);
+
         if (mission_type == "INSPECTION")
         {
             int completed_points = 0;
             auto count_stmt = g_db->prepare(R"(
-                SELECT COUNT(*)
-                FROM inspection_reports
-                WHERE mission_id = ?
-                  AND result = 'OK';
+                SELECT COUNT(*) FROM inspection_reports
+                WHERE mission_id = ? AND result = 'OK';
             )");
             count_stmt.execute(mission_id);
             count_stmt.fetch(completed_points);
@@ -914,36 +844,298 @@ json handle_mission_finished(const json& msg)
 
         auto stmt = g_db->prepare(R"(
             UPDATE missions
-            SET status = 'FINISHED',
-                finished_at = CURRENT_TIMESTAMP
-            WHERE mission_id = ?;
+            SET status = 'FINISHED', finished_at = CURRENT_TIMESTAMP
+            WHERE mission_id = ? AND drone_uri = ?;
         )");
+        stmt.execute(mission_id, drone_uri);
 
-        stmt.execute(mission_id);
+        auto drone_stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ?;
+        )");
+        drone_stmt.execute(drone_uri);
     }
 
     response["TYPE"] = "ACK_MISSION_FINISHED";
     response["MISSION_ID"] = mission_id;
     response["DRONE_URI"] = drone_uri;
+    response["ASSIGNMENTS"] = schedule_region(region_id);
 
-    std::cout << "[CENTRAL] Misija zavrsena: " << mission_id << std::endl;
+    std::cout << "[CENTRAL] Misija zavrsena: " << mission_id
+              << "; dron " << drone_uri << " je AVAILABLE." << std::endl;
 
     return response;
 }
 
-json handle_mission_request(const json& msg)
+bool mission_id_exists(const std::string& mission_id)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare("SELECT COUNT(*) FROM missions WHERE mission_id = ?;");
+    stmt.execute(mission_id);
+    int count = 0;
+    stmt.fetch(count);
+    return count > 0;
+}
+
+bool get_available_drone(const std::string& region_id, std::string& drone_uri)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        SELECT drone_uri
+        FROM drones
+        WHERE region_id = ?
+          AND status = 'AVAILABLE'
+          AND battery > 20
+        ORDER BY last_seen ASC
+        LIMIT 1;
+    )");
+    stmt.execute(region_id);
+    return stmt.fetch(drone_uri);
+}
+
+std::vector<std::string> get_queued_mission_ids(const std::string& region_id)
+{
+    std::vector<std::string> ids;
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        SELECT mission_id
+        FROM missions
+        WHERE region_id = ? AND status = 'QUEUED'
+        ORDER BY mission_priority DESC, created_at ASC;
+    )");
+    stmt.execute(region_id);
+    std::string mission_id;
+    while (stmt.fetch(mission_id))
+        ids.push_back(mission_id);
+    return ids;
+}
+
+bool build_assignment(const std::string& mission_id,
+                      const std::string& drone_uri,
+                      json& assignment)
+{
+    std::string region_id, mission_type, zone, route_id;
+    int mission_priority = 0;
+    int requested_altitude = 120;
+    double delivery_lat = 0.0, delivery_lon = 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto q = g_db->prepare("SELECT region_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); if (!q.fetch(region_id)) return false;
+        q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(mission_type);
+        q = g_db->prepare("SELECT mission_priority FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(mission_priority);
+        q = g_db->prepare("SELECT zone FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(zone);
+        q = g_db->prepare("SELECT route_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(route_id);
+        q = g_db->prepare("SELECT altitude FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(requested_altitude);
+        q = g_db->prepare("SELECT delivery_lat FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(delivery_lat);
+        q = g_db->prepare("SELECT delivery_lon FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(delivery_lon);
+    }
+
+    ZoneInfo zone_info = get_zone_info(region_id, zone);
+    if (!zone_info.found) return false;
+
+    GeoPoint exit_geo{0.0, 0.0};
+
+    if (mission_type == "DELIVERY")
+    {
+        LocalPoint delivery_offset = latlon_to_offset(
+            zone_info.center_lat, zone_info.center_lon, delivery_lat, delivery_lon);
+        int level = choose_delivery_contour(delivery_offset.north_m, delivery_offset.east_m,
+                                            zone_info.radius_m, zone_info.contours);
+        if (level < 0) return false;
+        route_id = zone + "_K" + std::to_string(level);
+        int half_size_m = (zone_info.radius_m * level) / zone_info.contours;
+        LocalPoint exit_local = closest_point_on_square_contour(
+            delivery_offset.north_m, delivery_offset.east_m, half_size_m);
+        exit_geo = offset_to_latlon(zone_info.center_lat, zone_info.center_lon,
+                                    exit_local.north_m, exit_local.east_m);
+    }
+    else if (route_id.empty() || route_id == "AUTO")
+    {
+        route_id = zone + "_K1";
+    }
+
+    RouteInfo route = get_route_info(region_id, zone, route_id);
+    if (!route.found) return false;
+
+    int assigned_altitude = 0;
+    int assigned_slot = -1;
+    if (!assign_altitude_slot(region_id, zone, route_id, route,
+                              requested_altitude, assigned_altitude, assigned_slot))
+    {
+        // Vazno: ruta puna NE izaziva preemption. Zadatak ostaje QUEUED.
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET drone_uri = ?, route_id = ?, altitude = ?, altitude_slot = ?,
+                exit_lat = ?, exit_lon = ?, status = 'ACTIVE'
+            WHERE mission_id = ? AND status = 'QUEUED';
+        )");
+        mission_stmt.execute(drone_uri, route_id, assigned_altitude, assigned_slot,
+                             exit_geo.lat, exit_geo.lon, mission_id);
+
+        auto drone_stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'BUSY', route_id = ?, altitude = ?, last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ? AND status = 'AVAILABLE';
+        )");
+        drone_stmt.execute(route_id, assigned_altitude, drone_uri);
+    }
+
+    assignment["TYPE"] = "START_MISSION";
+    assignment["MISSION_ID"] = mission_id;
+    assignment["ASSIGNED_DRONE"] = drone_uri;
+    assignment["DRONE_URI"] = drone_uri;
+    assignment["MISSION_TYPE"] = mission_type;
+    assignment["MISSION_PRIORITY"] = mission_priority;
+    assignment["ZONE"] = zone;
+    assignment["ROUTE_ID"] = route_id;
+    assignment["ROUTE_TYPE"] = route.route_type;
+    assignment["CONTOUR_LEVEL"] = route.contour_level;
+    assignment["CENTER_LAT"] = zone_info.center_lat;
+    assignment["CENTER_LON"] = zone_info.center_lon;
+    assignment["HALF_SIZE_M"] = route.half_size_m;
+    assignment["ALTITUDE"] = assigned_altitude;
+    assignment["ALTITUDE_SLOT"] = assigned_slot;
+    assignment["MAX_DRONES_ON_ROUTE"] = route.max_drones;
+    assignment["VERTICAL_SEPARATION_M"] = route.vertical_separation;
+
+    if (mission_type == "DELIVERY")
+    {
+        assignment["DELIVERY_LAT"] = delivery_lat;
+        assignment["DELIVERY_LON"] = delivery_lon;
+        assignment["EXIT_LAT"] = exit_geo.lat;
+        assignment["EXIT_LON"] = exit_geo.lon;
+    }
+    else if (mission_type == "INSPECTION")
+    {
+        json points = json::array();
+        const double h = static_cast<double>(route.half_size_m);
+        const double north_offsets[4] = { h, h, -h, -h };
+        const double east_offsets[4]  = { -h, h, h, -h };
+        for (int i = 0; i < 4; ++i)
+        {
+            GeoPoint p = offset_to_latlon(zone_info.center_lat, zone_info.center_lon,
+                                          north_offsets[i], east_offsets[i]);
+            json point;
+            point["POINT_ID"] = "I" + std::to_string(i + 1);
+            point["LAT"] = p.lat;
+            point["LON"] = p.lon;
+            points.push_back(point);
+        }
+        assignment["INSPECTION_POINTS"] = points;
+        assignment["REQUIRED_INSPECTION_POINTS"] = 4;
+    }
+
+    std::cout << "[CENTRAL][SCHEDULER] " << mission_id
+              << " (priority=" << mission_priority << ") -> " << drone_uri
+              << " | route=" << route_id << " | altitude=" << assigned_altitude
+              << std::endl;
+    return true;
+}
+
+json schedule_region(const std::string& region_id)
+{
+    // Scheduler je serijalizovan da dvije paralelne sesije ne dodijele isti AVAILABLE dron.
+    std::lock_guard<std::mutex> scheduler_lock(scheduler_mutex);
+    json assignments = json::array();
+
+    for (;;)
+    {
+        std::string drone_uri;
+        if (!get_available_drone(region_id, drone_uri))
+            break;
+
+        std::vector<std::string> queued = get_queued_mission_ids(region_id);
+        if (queued.empty())
+            break;
+
+        bool assigned = false;
+        // Red je vec sortiran po PRIORITY DESC, pa se bira prvi zadatak
+        // koji trenutno moze dobiti sigurnu rutu/visinski slot.
+        for (const auto& mission_id : queued)
+        {
+            json command;
+            if (build_assignment(mission_id, drone_uri, command))
+            {
+                assignments.push_back(command);
+                assigned = true;
+                break;
+            }
+        }
+
+        if (!assigned)
+            break;
+    }
+
+    return assignments;
+}
+
+json handle_drone_ready(const json& msg)
 {
     json response;
-
-    std::string mission_id = msg.value("MISSION_ID", "UNKNOWN_MISSION");
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
     std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
-    std::string mission_type = msg.value("MISSION_TYPE", "TEST_FLIGHT");
-    std::string zone = msg.value("ZONE", "");
-    std::string route_id = msg.value("ROUTE_ID", "");
-    int requested_altitude = msg.value("ALTITUDE", 120);
-    int mission_priority = get_mission_priority(mission_type);
 
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ?;
+        )");
+        stmt.execute(drone_uri);
+    }
+
+    response["TYPE"] = "ACK_DRONE_READY";
+    response["DRONE_URI"] = drone_uri;
+    response["STATUS"] = "AVAILABLE";
+    response["ASSIGNMENTS"] = schedule_region(region_id);
+
+    std::cout << "[CENTRAL] Dron " << drone_uri << " je AVAILABLE." << std::endl;
+    return response;
+}
+
+json handle_mission_submit(const json& msg)
+{
+    json response;
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
+    std::string mission_type = msg.value("MISSION_TYPE", "");
+    std::string zone = msg.value("ZONE", "");
+    std::string route_id = msg.value("ROUTE_ID", "AUTO");
+    int requested_altitude = msg.value("ALTITUDE", 120);
+    double delivery_lat = msg.value("DELIVERY_LAT", 0.0);
+    double delivery_lon = msg.value("DELIVERY_LON", 0.0);
+    int priority = get_mission_priority(mission_type);
+
+    if (mission_id.empty() || priority == 0)
+    {
+        response["TYPE"] = "MISSION_REJECTED";
+        response["REASON"] = "INVALID_MISSION_ID_OR_TYPE";
+        return response;
+    }
+    if (mission_id_exists(mission_id))
+    {
+        response["TYPE"] = "MISSION_REJECTED";
+        response["MISSION_ID"] = mission_id;
+        response["REASON"] = "DUPLICATE_MISSION_ID";
+        return response;
+    }
     if (!zone_exists(region_id, zone))
     {
         response["TYPE"] = "MISSION_REJECTED";
@@ -951,225 +1143,111 @@ json handle_mission_request(const json& msg)
         response["REASON"] = "INVALID_ZONE";
         return response;
     }
-
-    ZoneInfo zone_info = get_zone_info(region_id, zone);
-
-    if (!zone_info.found)
+    if (mission_type == "DELIVERY" && delivery_lat == 0.0 && delivery_lon == 0.0)
     {
         response["TYPE"] = "MISSION_REJECTED";
         response["MISSION_ID"] = mission_id;
-        response["REASON"] = "ZONE_INFO_NOT_FOUND";
+        response["REASON"] = "MISSING_DELIVERY_POINT";
         return response;
-    }
-
-    double delivery_lat = msg.value("DELIVERY_LAT", 0.0);
-    double delivery_lon = msg.value("DELIVERY_LON", 0.0);
-    GeoPoint exit_geo;
-    exit_geo.lat = 0.0;
-    exit_geo.lon = 0.0;
-
-    if (mission_type == "DELIVERY")
-    {
-        if (delivery_lat == 0.0 && delivery_lon == 0.0)
-        {
-            response["TYPE"] = "MISSION_REJECTED";
-            response["MISSION_ID"] = mission_id;
-            response["REASON"] = "MISSING_DELIVERY_POINT";
-            return response;
-        }
-
-        LocalPoint delivery_offset = latlon_to_offset(
-            zone_info.center_lat,
-            zone_info.center_lon,
-            delivery_lat,
-            delivery_lon
-        );
-
-        int level = choose_delivery_contour(
-            delivery_offset.north_m,
-            delivery_offset.east_m,
-            zone_info.radius_m,
-            zone_info.contours
-        );
-
-        if (level < 0)
-        {
-            response["TYPE"] = "MISSION_REJECTED";
-            response["MISSION_ID"] = mission_id;
-            response["REASON"] = "DELIVERY_POINT_OUTSIDE_ZONE";
-            return response;
-        }
-
-        route_id = zone + "_K" + std::to_string(level);
-
-        int half_size_m = (zone_info.radius_m * level) / zone_info.contours;
-
-        LocalPoint exit_local = closest_point_on_square_contour(
-            delivery_offset.north_m,
-            delivery_offset.east_m,
-            half_size_m
-        );
-
-        exit_geo = offset_to_latlon(
-            zone_info.center_lat,
-            zone_info.center_lon,
-            exit_local.north_m,
-            exit_local.east_m
-        );
-    }
-    else
-    {
-        if (route_id.empty() || route_id == "AUTO")
-        {
-            // Testni let i default misije idu na prvu konturu.
-            route_id = zone + "_K1";
-        }
-    }
-
-    RouteInfo route = get_route_info(region_id, zone, route_id);
-
-    if (!route.found)
-    {
-        response["TYPE"] = "MISSION_REJECTED";
-        response["MISSION_ID"] = mission_id;
-        response["REASON"] = "INVALID_ROUTE";
-        return response;
-    }
-
-    int assigned_altitude = 0;
-    int assigned_slot = -1;
-
-    bool preempted = false;
-    PreemptedMission preempted_mission;
-
-    if (!assign_altitude_slot(region_id, zone, route_id, route,
-                              requested_altitude,
-                              assigned_altitude,
-                              assigned_slot))
-    {
-        // Ruta je puna. Provjerava se da li nova misija ima veći prioritet
-        // od neke aktivne misije na istoj ruti.
-        preempted_mission = find_lowest_priority_active_mission(region_id, zone, route_id);
-
-        if (preempted_mission.found &&
-            mission_priority > preempted_mission.mission_priority)
-        {
-            mark_mission_preempted(preempted_mission.mission_id, mission_id);
-
-            assigned_slot = preempted_mission.altitude_slot;
-            assigned_altitude = preempted_mission.altitude;
-            preempted = true;
-        }
-        else
-        {
-            response["TYPE"] = "MISSION_REJECTED";
-            response["MISSION_ID"] = mission_id;
-            response["REASON"] = "ROUTE_CAPACITY_FULL_OR_LOW_PRIORITY";
-            response["NEW_MISSION_PRIORITY"] = mission_priority;
-
-            if (preempted_mission.found)
-            {
-                response["LOWEST_ACTIVE_PRIORITY"] = preempted_mission.mission_priority;
-            }
-
-            return response;
-        }
     }
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
-
         auto stmt = g_db->prepare(R"(
             INSERT INTO missions
             (mission_id, drone_uri, region_id, mission_type, mission_priority, zone, route_id,
              altitude, altitude_slot, delivery_lat, delivery_lon, exit_lat, exit_lon, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE');
+            VALUES (?, '', ?, ?, ?, ?, ?, ?, -1, ?, ?, 0, 0, 'QUEUED');
         )");
-
-        stmt.execute(mission_id, drone_uri, region_id, mission_type, mission_priority, zone, route_id,
-                     assigned_altitude, assigned_slot,
-                     delivery_lat, delivery_lon, exit_geo.lat, exit_geo.lon);
+        stmt.execute(mission_id, region_id, mission_type, priority, zone, route_id,
+                     requested_altitude, delivery_lat, delivery_lon);
     }
 
-    response["TYPE"] = "MISSION_APPROVED";
+    json assignments = schedule_region(region_id);
+    std::string current_status = "QUEUED";
+    std::string assigned_drone;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto s = g_db->prepare("SELECT status FROM missions WHERE mission_id = ?;");
+        s.execute(mission_id); s.fetch(current_status);
+        s = g_db->prepare("SELECT drone_uri FROM missions WHERE mission_id = ?;");
+        s.execute(mission_id); s.fetch(assigned_drone);
+    }
+
+    response["TYPE"] = "MISSION_SUBMITTED";
     response["MISSION_ID"] = mission_id;
-    response["DRONE_URI"] = drone_uri;
-    response["COMMAND"] = "START_MISSION";
     response["MISSION_TYPE"] = mission_type;
-    response["ZONE"] = zone;
-    response["ROUTE_ID"] = route_id;
-    response["ROUTE_TYPE"] = route.route_type;
-    response["CONTOUR_LEVEL"] = route.contour_level;
-    response["CENTER_LAT"] = zone_info.center_lat;
-    response["CENTER_LON"] = zone_info.center_lon;
-    response["HALF_SIZE_M"] = route.half_size_m;
-    response["ALTITUDE"] = assigned_altitude;
-    response["ALTITUDE_SLOT"] = assigned_slot;
-    response["MISSION_PRIORITY"] = mission_priority;
-    response["MAX_DRONES_ON_ROUTE"] = route.max_drones;
-    response["VERTICAL_SEPARATION_M"] = route.vertical_separation;
+    response["MISSION_PRIORITY"] = priority;
+    response["STATUS"] = current_status;
+    response["ASSIGNED_DRONE"] = assigned_drone;
+    response["ASSIGNMENTS"] = assignments;
 
-    if (preempted)
+    std::cout << "[CENTRAL] Zadatak primljen: " << mission_id
+              << " | type=" << mission_type << " | priority=" << priority
+              << " | status=" << current_status << std::endl;
+    return response;
+}
+
+json handle_stop_mission_request(const json& msg)
+{
+    json response;
+    std::string mission_id = msg.value("MISSION_ID", "");
+    if (mission_id.empty())
     {
-        response["PREEMPTED_DRONE"] = preempted_mission.drone_uri;
-        response["PREEMPTED_MISSION_ID"] = preempted_mission.mission_id;
-        response["PREEMPTED_PRIORITY"] = preempted_mission.mission_priority;
-        response["PREEMPTION_REASON"] = "HIGHER_PRIORITY_MISSION";
+        response["TYPE"] = "ERROR";
+        response["MESSAGE"] = "MISSING_MISSION_ID";
+        return response;
     }
 
-    if (mission_type == "DELIVERY")
+    std::string drone_uri, region_id, status;
     {
-        response["DELIVERY_LAT"] = delivery_lat;
-        response["DELIVERY_LON"] = delivery_lon;
-        response["EXIT_LAT"] = exit_geo.lat;
-        response["EXIT_LON"] = exit_geo.lon;
-    }
-    else if (mission_type == "INSPECTION")
-    {
-        // Cetiri inspection tacke su uglovi dodijeljene kvadratne konture.
-        // Redoslijed je I1 -> I2 -> I3 -> I4; dron nakon svake tacke salje INSPECTION_REPORT.
-        json points = json::array();
-
-        const double h = static_cast<double>(route.half_size_m);
-        const double north_offsets[4] = { h, h, -h, -h };
-        const double east_offsets[4]  = { -h, h, h, -h };
-
-        for (int i = 0; i < 4; ++i)
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT drone_uri FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); if (!q.fetch(drone_uri))
         {
-            GeoPoint p = offset_to_latlon(zone_info.center_lat, zone_info.center_lon,
-                                          north_offsets[i], east_offsets[i]);
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = "MISSION_NOT_FOUND";
+            return response;
+        }
+        q = g_db->prepare("SELECT region_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(region_id);
+        q = g_db->prepare("SELECT status FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(status);
 
-            json point;
-            point["POINT_ID"] = "I" + std::to_string(i + 1);
-            point["LAT"] = p.lat;
-            point["LON"] = p.lon;
-            points.push_back(point);
+        if (status == "QUEUED")
+        {
+            auto cancel = g_db->prepare(R"(
+                UPDATE missions SET status = 'CANCELLED', finished_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ?;
+            )");
+            cancel.execute(mission_id);
+            response["TYPE"] = "MISSION_CANCELLED";
+            response["MISSION_ID"] = mission_id;
+            return response;
+        }
+        if (status != "ACTIVE")
+        {
+            response["TYPE"] = "ERROR";
+            response["MESSAGE"] = "MISSION_NOT_ACTIVE";
+            response["STATUS"] = status;
+            return response;
         }
 
-        response["INSPECTION_POINTS"] = points;
-        response["REQUIRED_INSPECTION_POINTS"] = 4;
+        auto u = g_db->prepare("UPDATE missions SET status = 'STOP_REQUESTED' WHERE mission_id = ?;");
+        u.execute(mission_id);
     }
 
-    std::cout << "[CENTRAL] Misija odobrena: " << mission_id
-              << " | type=" << mission_type
-              << " | " << zone << "/" << route_id
-              << " | priority=" << mission_priority
-              << " | slot=" << assigned_slot
-              << " | altitude=" << assigned_altitude << "m";
+    json command;
+    command["TYPE"] = "STOP_MISSION";
+    command["MISSION_ID"] = mission_id;
+    command["DRONE_URI"] = drone_uri;
+    command["REASON"] = "OPERATOR_REQUEST";
 
-    if (mission_type == "DELIVERY")
-    {
-        std::cout << " | exit=" << exit_geo.lat << "," << exit_geo.lon;
-    }
-
-    if (preempted)
-    {
-        std::cout << " | preempted=" << preempted_mission.drone_uri
-                  << "/" << preempted_mission.mission_id;
-    }
-
-    std::cout << std::endl;
-
+    response["TYPE"] = "STOP_MISSION_DISPATCH";
+    response["MISSION_ID"] = mission_id;
+    response["TARGET_DRONE"] = drone_uri;
+    response["COMMAND"] = command;
+    response["REGION_ID"] = region_id;
     return response;
 }
 
@@ -1235,13 +1313,21 @@ private:
                 response["TYPE"] = "ACK";
                 response["MESSAGE"] = "DRONE_STATUS_SAVED";
             }
+            else if (type == "DRONE_READY")
+            {
+                response = handle_drone_ready(msg);
+            }
             else if (type == "ALARM")
             {
                 response = handle_alarm(msg);
             }
-            else if (type == "MISSION_REQUEST")
+            else if (type == "MISSION_SUBMIT" || type == "MISSION_REQUEST")
             {
-                response = handle_mission_request(msg);
+                response = handle_mission_submit(msg);
+            }
+            else if (type == "STOP_MISSION_REQUEST")
+            {
+                response = handle_stop_mission_request(msg);
             }
             else if (type == "INSPECTION_REPORT")
             {
