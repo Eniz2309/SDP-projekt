@@ -1,8 +1,10 @@
 // drone_client.cpp
 // v9_scheduler: dron vise ne bira vlastitu misiju.
+// v10_formation: FORMATION nema drone-leadera; regionalni server je VIRTUAL_LEADER.
+// Svi clanovi formacije lete na istoj visini i dobijaju horizontalne targete od servera.
 // Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
 // TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
-// Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, RTB i STOP_MISSION.
+// Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, FORMATION, RTB i STOP_MISSION.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -74,7 +76,10 @@ public:
           reached_exit_point_(false),
           package_delivered_(false),
           mission_finished_sent_(false),
-          low_battery_alarm_sent_(false)
+          low_battery_alarm_sent_(false),
+          formation_mode_(false),
+          formation_offset_north_m_(0.0),
+          formation_offset_east_m_(0.0)
     {
     }
 
@@ -155,6 +160,13 @@ private:
         msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
         msg["ROUTE_ID"] = active_route_id_;
+        if (formation_mode_)
+        {
+            msg["FORMATION_ID"] = formation_id_;
+            msg["FORMATION_CONTROLLER"] = "REGIONAL_SERVER";
+            msg["OFFSET_NORTH_M"] = formation_offset_north_m_;
+            msg["OFFSET_EAST_M"] = formation_offset_east_m_;
+        }
 
         send_udp_json(msg);
 
@@ -191,6 +203,13 @@ private:
         msg["SPEED"] = speed_;
         msg["DIRECTION"] = direction_;
         msg["ROUTE_ID"] = active_route_id_;
+        if (formation_mode_)
+        {
+            msg["FORMATION_ID"] = formation_id_;
+            msg["FORMATION_CONTROLLER"] = "REGIONAL_SERVER";
+            msg["OFFSET_NORTH_M"] = formation_offset_north_m_;
+            msg["OFFSET_EAST_M"] = formation_offset_east_m_;
+        }
 
         send_udp_json(msg);
 
@@ -363,6 +382,15 @@ private:
     {
         const double MOVE_STEP = 0.00008;
 
+        if (status_ == "FORMATION" && formation_mode_)
+        {
+            // Poziciju ne racuna drugi dron. Server salje target formacijskog clana.
+            // Malo veci korak omogucava da dron prati virtual leader koji se osvjezava svake 2 s.
+            const double FORMATION_MOVE_STEP = 0.00025;
+            move_towards(formation_target_, FORMATION_MOVE_STEP);
+            return;
+        }
+
         if (status_ == "ON_MISSION" && delivery_mode_)
         {
             // 1) Dron ide do izlazne tačke na konturi.
@@ -519,10 +547,58 @@ private:
                 status_ = "AVAILABLE";
                 std::cout << "[DRONE] Central confirms AVAILABLE state.\n";
             }
+            else if (type == "START_FORMATION")
+            {
+                mission_id_ = msg.value("MISSION_ID", mission_id_);
+                mission_type_ = "FORMATION";
+                formation_id_ = mission_id_;
+                active_route_id_ = msg.value("ROUTE_ID", "");
+                altitude_ = msg.value("ALTITUDE", altitude_);
+                formation_offset_north_m_ = msg.value("OFFSET_NORTH_M", 0.0);
+                formation_offset_east_m_ = msg.value("OFFSET_EAST_M", 0.0);
+                formation_mode_ = true;
+                mission_finished_sent_ = false;
+                route_points_.clear();
+                inspection_points_.clear();
+                delivery_mode_ = false;
+                status_ = "FORMATION";
+
+                formation_target_.lat = lat_;
+                formation_target_.lon = lon_;
+
+                std::cout << "[DRONE] FORMATION started. mission=" << mission_id_
+                          << " controller=" << msg.value("FORMATION_CONTROLLER", "REGIONAL_SERVER")
+                          << " same_altitude=" << msg.value("SAME_ALTITUDE", true)
+                          << " alt=" << altitude_
+                          << "m offset=(N:" << formation_offset_north_m_
+                          << "m,E:" << formation_offset_east_m_ << "m)" << std::endl;
+            }
+            else if (type == "FORMATION_UPDATE")
+            {
+                std::string incoming_id = msg.value("MISSION_ID", "");
+                if (formation_mode_ && incoming_id == formation_id_)
+                {
+                    formation_target_.lat = msg.value("TARGET_LAT", lat_);
+                    formation_target_.lon = msg.value("TARGET_LON", lon_);
+                    altitude_ = msg.value("ALTITUDE", altitude_);
+                    formation_offset_north_m_ = msg.value("OFFSET_NORTH_M", formation_offset_north_m_);
+                    formation_offset_east_m_ = msg.value("OFFSET_EAST_M", formation_offset_east_m_);
+
+                    std::cout << "[DRONE][FORMATION] target="
+                              << formation_target_.lat << "," << formation_target_.lon
+                              << " alt=" << altitude_
+                              << " virtual_leader="
+                              << msg.value("VIRTUAL_LEADER_LAT", 0.0) << ","
+                              << msg.value("VIRTUAL_LEADER_LON", 0.0)
+                              << std::endl;
+                }
+            }
             else if (type == "START_MISSION" || type == "MISSION_APPROVED")
             {
                 mission_id_ = msg.value("MISSION_ID", mission_id_);
                 mission_type_ = msg.value("MISSION_TYPE", mission_type_);
+                formation_mode_ = false;
+                formation_id_.clear();
                 active_route_id_ = msg.value("ROUTE_ID", route_id_);
                 altitude_ = msg.value("ALTITUDE", altitude_);
 
@@ -688,6 +764,11 @@ private:
                 reached_exit_point_ = false;
                 package_delivered_ = false;
 
+                formation_mode_ = false;
+                formation_id_.clear();
+                formation_offset_north_m_ = 0.0;
+                formation_offset_east_m_ = 0.0;
+
                 mission_finished_sent_ = true;
 
                 std::cout << "[DRONE] STOP_MISSION primljen. mission="
@@ -852,6 +933,12 @@ private:
     bool package_delivered_;
     bool mission_finished_sent_;
     bool low_battery_alarm_sent_;
+
+    bool formation_mode_;
+    std::string formation_id_;
+    double formation_offset_north_m_;
+    double formation_offset_east_m_;
+    GeoPoint formation_target_;
 };
 
 int main(int argc, char* argv[])
