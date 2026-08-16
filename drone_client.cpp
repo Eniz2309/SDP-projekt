@@ -1,6 +1,7 @@
 // drone_client.cpp
 // v9_scheduler: dron vise ne bira vlastitu misiju.
 // v10_formation: FORMATION nema drone-leadera; regionalni server je VIRTUAL_LEADER.
+// v11_control_commands: CHANGE_PARAMS i rucni RETURN_TO_BASE dolaze kroz regionalni server.
 // Svi clanovi formacije lete na istoj visini i dobijaju horizontalne targete od servera.
 // Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
 // TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
@@ -712,6 +713,14 @@ private:
                 std::cerr << "[DRONE] Mission finish rejected: "
                           << msg.value("REASON", "UNKNOWN") << std::endl;
             }
+            else if (type == "ACK_PARAMS_SAVED")
+            {
+                std::cout << "[DRONE] Regional/central confirmed new flight parameters.\n";
+            }
+            else if (type == "ACK_RTB_SAVED")
+            {
+                std::cout << "[DRONE] Regional/central recorded RETURN_TO_BASE state.\n";
+            }
             else if (type == "CHANGE_PARAMS")
             {
                 handle_change_params(msg);
@@ -722,10 +731,18 @@ private:
                 double base_lon = msg.value("BASE_LON", lon_);
 
                 status_ = "RETURN_TO_BASE";
-                active_route_id_ = "";
+                active_route_id_.clear();
                 route_points_.clear();
+                current_waypoint_ = 0;
                 inspection_points_.clear();
                 current_inspection_point_ = 0;
+                delivery_mode_ = false;
+                reached_exit_point_ = false;
+                package_delivered_ = false;
+                formation_mode_ = false;
+                formation_id_.clear();
+                formation_offset_north_m_ = 0.0;
+                formation_offset_east_m_ = 0.0;
 
                 // Demo verzija: dron se odmah vrati na bazne koordinate.
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
@@ -743,6 +760,9 @@ private:
                 ack["BASE_LON"] = base_lon;
                 ack["BATTERY"] = battery_;
                 ack["ALTITUDE"] = altitude_;
+                ack["STATUS"] = status_;
+                ack["ROUTE_ID"] = active_route_id_;
+                ack["REASON"] = msg.value("REASON", "UNKNOWN_REASON");
                 send_json(ack);
             }
             else if (type == "STOP_MISSION")
@@ -824,10 +844,17 @@ private:
         ack["ALTITUDE"] = altitude_;
         ack["SPEED"] = speed_;
         ack["DIRECTION"] = direction_;
+        ack["BATTERY"] = battery_;
+        ack["STATUS"] = status_;
+        ack["LAT"] = lat_;
+        ack["LON"] = lon_;
+        ack["ROUTE_ID"] = active_route_id_;
 
         send_json(ack);
 
-        std::cout << "[DRONE] New parameters applied.\n";
+        std::cout << "[DRONE] New parameters applied. altitude=" << altitude_
+                  << " speed=" << speed_
+                  << " direction=" << direction_ << std::endl;
     }
 
     // UDP: jedan JSON objekat = jedan datagram. Nema \n delimiter-a niti ACK-a.
