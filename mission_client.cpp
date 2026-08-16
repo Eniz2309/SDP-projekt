@@ -1,5 +1,6 @@
 // mission_client.cpp
 // Jednostavan testni/operator CLI za slanje zadataka regionalnom serveru.
+// v10: FORMATION <zone> <route> <altitude> [formation_size] [spacing_m]
 // Nije dron i ne ucestvuje u telemetriji; koristi se za demonstraciju centralne dodjele zadataka.
 
 #include <boost/asio.hpp>
@@ -45,13 +46,16 @@ int main(int argc, char* argv[])
     {
         std::cerr << "SUBMIT:\n"
                   << "./mission_client <regional_host> <tcp_port> <mission_id> <mission_type> <zone> "
-                  << "[route_id] [base_altitude] [delivery_lat] [delivery_lon]\n\n"
+                  << "[route_id] [base_altitude] [arg8] [arg9]\n"
+                  << "  DELIVERY:  arg8=delivery_lat arg9=delivery_lon\n"
+                  << "  FORMATION: arg8=formation_size arg9=spacing_m\n\n"
                   << "STOP:\n"
                   << "./mission_client <regional_host> <tcp_port> STOP <mission_id>\n\n"
                   << "Primjeri:\n"
                   << "./mission_client 127.0.0.1 8000 M001 MONITORING SKENDERIJA SKENDERIJA_K2 120\n"
                   << "./mission_client 127.0.0.1 8000 M002 INSPECTION SKENDERIJA SKENDERIJA_K2 120\n"
                   << "./mission_client 127.0.0.1 8000 M003 DELIVERY SKENDERIJA AUTO 120 43.8580 18.4160\n"
+                  << "./mission_client 127.0.0.1 8000 M_FORM FORMATION SKENDERIJA SKENDERIJA_K2 120 3 10\n"
                   << "./mission_client 127.0.0.1 8000 STOP M001\n";
         return 1;
     }
@@ -73,6 +77,14 @@ int main(int argc, char* argv[])
         }
         req["DELIVERY_LAT"] = std::stod(argv[8]);
         req["DELIVERY_LON"] = std::stod(argv[9]);
+    }
+
+    if (std::string(argv[4]) == "FORMATION")
+    {
+        int formation_size = (argc >= 9) ? std::atoi(argv[8]) : 3;
+        double spacing_m = (argc >= 10) ? std::stod(argv[9]) : 10.0;
+        req["FORMATION_SIZE"] = formation_size;
+        req["FORMATION_SPACING_M"] = spacing_m;
     }
 
     try
