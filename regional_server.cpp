@@ -1,5 +1,7 @@
 // regional_server.cpp
 // v9_scheduler: regionalni server posreduje izmedju centralnog servera, dronova i testnog mission clienta.
+// v10_formation: regionalni server je FORMATION_CONTROLLER / VIRTUAL_LEADER.
+// Periodicki salje FORMATION_UPDATE svim clanovima; svi clanovi ostaju na istoj visini.
 // Dronovi se registruju kao AVAILABLE; centralni server dodjeljuje START_MISSION slobodnim dronovima.
 // Prioritet ne prekida aktivnu misiju. STOP_MISSION se koristi samo kao posebna kontrolna komanda.
 // Watchdog, UDP telemetrija/keepalive, INSPECTION i RTB ostaju podrzani.
@@ -18,6 +20,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <atomic>
+#include <cmath>
 
 #include <sqlite3.h>
 #include "json/json.h"
@@ -127,29 +131,232 @@ bool send_to_drone(const std::string& drone_uri, const json& msg)
     }
 }
 
+struct FormationMemberControl
+{
+    std::string drone_uri;
+    double offset_north_m;
+    double offset_east_m;
+};
+
+struct FormationControl
+{
+    std::string mission_id;
+    std::string route_id;
+    double center_lat;
+    double center_lon;
+    double half_size_m;
+    int altitude;
+    std::vector<FormationMemberControl> members;
+    std::atomic<bool> active;
+
+    FormationControl()
+        : center_lat(0.0), center_lon(0.0), half_size_m(250.0),
+          altitude(120), active(true) {}
+};
+
+std::mutex formations_mutex;
+std::unordered_map<std::string, std::shared_ptr<FormationControl>> active_formations;
+
+struct FormationGeoPoint
+{
+    double lat;
+    double lon;
+};
+
+FormationGeoPoint formation_offset_to_latlon(double center_lat, double center_lon,
+                                              double north_m, double east_m)
+{
+    const double PI = 3.14159265358979323846;
+    const double meters_per_deg_lat = 111320.0;
+    const double meters_per_deg_lon = 111320.0 * std::cos(center_lat * PI / 180.0);
+
+    FormationGeoPoint p;
+    p.lat = center_lat + north_m / meters_per_deg_lat;
+    p.lon = center_lon + east_m / meters_per_deg_lon;
+    return p;
+}
+
+void stop_formation_controller(const std::string& mission_id)
+{
+    std::lock_guard<std::mutex> lock(formations_mutex);
+    auto it = active_formations.find(mission_id);
+    if (it != active_formations.end())
+    {
+        it->second->active = false;
+        active_formations.erase(it);
+        std::cout << "[REGIONAL][FORMATION] Virtual leader za "
+                  << mission_id << " zaustavljen." << std::endl;
+    }
+}
+
+void formation_controller_loop(const std::shared_ptr<FormationControl>& formation)
+{
+    // Virtual leader obilazi kvadratnu konturu u lokalnim metrima.
+    const double h = formation->half_size_m;
+    const double north_points[5] = { h, h, -h, -h, h };
+    const double east_points[5]  = { -h, h, h, -h, -h };
+    const double STEP_M = 20.0;
+
+    double leader_north = north_points[0];
+    double leader_east = east_points[0];
+    int target_index = 1;
+    unsigned long sequence = 0;
+
+    std::cout << "[REGIONAL][FORMATION] VIRTUAL_LEADER start mission="
+              << formation->mission_id
+              << " | members=" << formation->members.size()
+              << " | altitude=" << formation->altitude << "m" << std::endl;
+
+    while (formation->active)
+    {
+        double dn = north_points[target_index] - leader_north;
+        double de = east_points[target_index] - leader_east;
+        double dist = std::sqrt(dn * dn + de * de);
+
+        if (dist <= STEP_M || dist == 0.0)
+        {
+            leader_north = north_points[target_index];
+            leader_east = east_points[target_index];
+            target_index++;
+            if (target_index >= 5)
+                target_index = 1;
+        }
+        else
+        {
+            leader_north += STEP_M * dn / dist;
+            leader_east += STEP_M * de / dist;
+        }
+
+        FormationGeoPoint leader_geo = formation_offset_to_latlon(
+            formation->center_lat, formation->center_lon,
+            leader_north, leader_east);
+
+        for (const auto& member : formation->members)
+        {
+            // Offseti su horizontalni; ALTITUDE je isti za sve clanove.
+            FormationGeoPoint target_geo = formation_offset_to_latlon(
+                formation->center_lat, formation->center_lon,
+                leader_north + member.offset_north_m,
+                leader_east + member.offset_east_m);
+
+            json update;
+            update["TYPE"] = "FORMATION_UPDATE";
+            update["MISSION_ID"] = formation->mission_id;
+            update["FORMATION_CONTROLLER"] = "REGIONAL_SERVER";
+            update["SEQUENCE"] = sequence;
+            update["VIRTUAL_LEADER_LAT"] = leader_geo.lat;
+            update["VIRTUAL_LEADER_LON"] = leader_geo.lon;
+            update["TARGET_LAT"] = target_geo.lat;
+            update["TARGET_LON"] = target_geo.lon;
+            update["ALTITUDE"] = formation->altitude;
+            update["OFFSET_NORTH_M"] = member.offset_north_m;
+            update["OFFSET_EAST_M"] = member.offset_east_m;
+
+            if (!send_to_drone(member.drone_uri, update))
+            {
+                std::cerr << "[REGIONAL][FORMATION] Update nije isporucen "
+                          << member.drone_uri << std::endl;
+            }
+        }
+
+        if ((sequence % 5) == 0)
+        {
+            std::cout << "[REGIONAL][FORMATION] " << formation->mission_id
+                      << " | virtual_leader=" << leader_geo.lat << ","
+                      << leader_geo.lon << " | alt=" << formation->altitude
+                      << "m" << std::endl;
+        }
+
+        ++sequence;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
+void start_formation_from_commands(const std::string& mission_id,
+                                   const std::vector<json>& commands)
+{
+    if (commands.empty())
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(formations_mutex);
+        if (active_formations.find(mission_id) != active_formations.end())
+            return;
+    }
+
+    auto formation = std::make_shared<FormationControl>();
+    formation->mission_id = mission_id;
+    formation->route_id = commands[0].value("ROUTE_ID", "");
+    formation->center_lat = commands[0].value("CENTER_LAT", 0.0);
+    formation->center_lon = commands[0].value("CENTER_LON", 0.0);
+    formation->half_size_m = commands[0].value("HALF_SIZE_M", 250.0);
+    formation->altitude = commands[0].value("ALTITUDE", 120);
+
+    for (const auto& command : commands)
+    {
+        FormationMemberControl member;
+        member.drone_uri = command.value("ASSIGNED_DRONE", "UNKNOWN_DRONE");
+        member.offset_north_m = command.value("OFFSET_NORTH_M", 0.0);
+        member.offset_east_m = command.value("OFFSET_EAST_M", 0.0);
+        formation->members.push_back(member);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(formations_mutex);
+        active_formations[mission_id] = formation;
+    }
+
+    std::thread(formation_controller_loop, formation).detach();
+}
+
 void dispatch_assignments(const json& response)
 {
     if (!response.contains("ASSIGNMENTS") || !response["ASSIGNMENTS"].is_array())
         return;
 
+    std::unordered_map<std::string, std::vector<json>> formation_commands;
+
     for (const auto& command : response["ASSIGNMENTS"])
     {
-        if (command.value("TYPE", "") != "START_MISSION")
-            continue;
-
+        std::string type = command.value("TYPE", "");
         std::string target = command.value("ASSIGNED_DRONE", "UNKNOWN_DRONE");
-        if (send_to_drone(target, command))
+
+        if (type == "START_MISSION")
         {
-            std::cout << "[REGIONAL][SCHEDULER] START_MISSION poslan dronu "
-                      << target << " | mission="
-                      << command.value("MISSION_ID", "UNKNOWN_MISSION") << std::endl;
+            if (send_to_drone(target, command))
+            {
+                std::cout << "[REGIONAL][SCHEDULER] START_MISSION poslan dronu "
+                          << target << " | mission="
+                          << command.value("MISSION_ID", "UNKNOWN_MISSION") << std::endl;
+            }
+            else
+            {
+                std::cerr << "[REGIONAL][SCHEDULER] Nema aktivne TCP konekcije za "
+                          << target << "; zadatak nije isporucen." << std::endl;
+            }
         }
-        else
+        else if (type == "START_FORMATION")
         {
-            std::cerr << "[REGIONAL][SCHEDULER] Nema aktivne TCP konekcije za "
-                      << target << "; zadatak nije isporucen." << std::endl;
+            std::string mission_id = command.value("MISSION_ID", "UNKNOWN_MISSION");
+            if (send_to_drone(target, command))
+            {
+                formation_commands[mission_id].push_back(command);
+                std::cout << "[REGIONAL][FORMATION] START_FORMATION -> "
+                          << target << " | mission=" << mission_id
+                          << " | alt=" << command.value("ALTITUDE", 0)
+                          << " | offset_east=" << command.value("OFFSET_EAST_M", 0.0)
+                          << "m" << std::endl;
+            }
+            else
+            {
+                std::cerr << "[REGIONAL][FORMATION] Dron nije povezan: "
+                          << target << std::endl;
+            }
         }
     }
+
+    for (const auto& entry : formation_commands)
+        start_formation_from_commands(entry.first, entry.second);
 }
 
 // Watchdog prati kada je posljednji put primljena poruka od svakog drona.
@@ -625,6 +832,25 @@ json handle_drone_message(json msg)
                 std::cout << "[REGIONAL] STOP_MISSION poslan dronu " << target
                           << " na zahtjev operatora." << std::endl;
             }
+        }
+        else if (response.value("TYPE", "") == "STOP_FORMATION_DISPATCH")
+        {
+            std::string mission_id = response.value("MISSION_ID", "UNKNOWN_MISSION");
+            stop_formation_controller(mission_id);
+
+            int delivered = 0;
+            if (response.contains("COMMANDS") && response["COMMANDS"].is_array())
+            {
+                for (const auto& command : response["COMMANDS"])
+                {
+                    std::string target = command.value("DRONE_URI", "UNKNOWN_DRONE");
+                    if (send_to_drone(target, command))
+                        ++delivered;
+                }
+            }
+            response["STOP_COMMANDS_DELIVERED"] = delivered;
+            std::cout << "[REGIONAL][FORMATION] STOP poslan za " << mission_id
+                      << " | delivered=" << delivered << std::endl;
         }
     }
     else if (type == "INSPECTION_REPORT")
