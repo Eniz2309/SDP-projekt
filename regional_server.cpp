@@ -702,14 +702,14 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
         for (;;)
         {
             boost::system::error_code ec;
-            boost::asio::read_until(*connection->socket, buffer, "\\n", ec);
+            boost::asio::read_until(*connection->socket, buffer, "\n", ec);
 
             if (ec)
             {
                 std::cout << "[REGIONAL] Dron prekinuo TCP konekciju";
                 if (!registered_drone_uri.empty())
                     std::cout << ": " << registered_drone_uri;
-                std::cout << ".\\n";
+                std::cout << ".\n";
                 break;
             }
 
@@ -733,7 +733,7 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
 
             json response = handle_drone_message(msg);
 
-            std::string out = response.dump() + "\\n";
+            std::string out = response.dump() + "\n";
             {
                 std::lock_guard<std::mutex> write_lock(connection->write_mutex);
                 boost::asio::write(*connection->socket, boost::asio::buffer(out));
