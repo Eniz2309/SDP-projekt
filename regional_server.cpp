@@ -1,6 +1,7 @@
 // regional_server.cpp
 // v9_scheduler: regionalni server posreduje izmedju centralnog servera, dronova i testnog mission clienta.
 // v10_formation: regionalni server je FORMATION_CONTROLLER / VIRTUAL_LEADER.
+// v11_control_commands: prosljedjuje operatorove PARAMS i MANUAL RTB komande tacno odabranom dronu.
 // Periodicki salje FORMATION_UPDATE svim clanovima; svi clanovi ostaju na istoj visini.
 // Dronovi se registruju kao AVAILABLE; centralni server dodjeljuje START_MISSION slobodnim dronovima.
 // Prioritet ne prekida aktivnu misiju. STOP_MISSION se koristi samo kao posebna kontrolna komanda.
@@ -813,6 +814,60 @@ json handle_drone_message(json msg)
             dispatch_assignments(response);
         }
     }
+    else if (type == "CONTROL_PARAMS_REQUEST")
+    {
+        response = send_to_central(msg);
+
+        if (response.value("TYPE", "") == "CHANGE_PARAMS_DISPATCH")
+        {
+            std::string target = response.value("TARGET_DRONE", "UNKNOWN_DRONE");
+            json command;
+            if (response.contains("COMMAND"))
+                command = response["COMMAND"];
+
+            if (!send_to_drone(target, command))
+            {
+                response["TYPE"] = "CONTROL_DELIVERY_FAILED";
+                response["DRONE_URI"] = target;
+                response["REASON"] = "TARGET_DRONE_NOT_CONNECTED";
+            }
+            else
+            {
+                response["DELIVERED"] = true;
+                std::cout << "[REGIONAL][CONTROL] CHANGE_PARAMS poslan dronu "
+                          << target << std::endl;
+            }
+        }
+    }
+    else if (type == "MANUAL_RTB_REQUEST")
+    {
+        response = send_to_central(msg);
+
+        if (response.value("TYPE", "") == "RETURN_TO_BASE_DISPATCH")
+        {
+            std::string target = response.value("TARGET_DRONE", "UNKNOWN_DRONE");
+            json command;
+            if (response.contains("COMMAND"))
+                command = response["COMMAND"];
+
+            if (!send_to_drone(target, command))
+            {
+                response["TYPE"] = "RTB_DELIVERY_FAILED";
+                response["DRONE_URI"] = target;
+                response["REASON"] = "TARGET_DRONE_NOT_CONNECTED";
+            }
+            else
+            {
+                response["DELIVERED"] = true;
+                std::cout << "[REGIONAL][CONTROL] RETURN_TO_BASE poslan dronu "
+                          << target << std::endl;
+            }
+
+            // Ako je RTB prekinuo aktivnu misiju, scheduler moze odmah
+            // dodijeliti neki QUEUED zadatak drugom slobodnom dronu.
+            dispatch_assignments(response);
+        }
+    }
     else if (type == "STOP_MISSION_REQUEST")
     {
         response = send_to_central(msg);
@@ -889,6 +944,36 @@ json handle_drone_message(json msg)
         response = send_to_central(msg);
         dispatch_assignments(response);
     }
+    else if (type == "ACK_PARAMS")
+    {
+        std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+
+        json status_msg;
+        status_msg["TYPE"] = "DRONE_STATUS";
+        status_msg["DRONE_URI"] = drone_uri;
+        status_msg["BATTERY"] = msg.value("BATTERY", -1);
+        status_msg["STATUS"] = msg.value("STATUS", "UNKNOWN");
+        status_msg["LAT"] = msg.value("LAT", 0.0);
+        status_msg["LON"] = msg.value("LON", 0.0);
+        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        status_msg["ROUTE_ID"] = msg.value("ROUTE_ID", "");
+
+        save_drone_status(status_msg);
+        json central_response = send_to_central(status_msg);
+
+        response["TYPE"] = "ACK_PARAMS_SAVED";
+        response["DRONE_URI"] = drone_uri;
+        response["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        response["SPEED"] = msg.value("SPEED", 0);
+        response["DIRECTION"] = msg.value("DIRECTION", "");
+        response["CENTRAL_RESPONSE"] = central_response;
+
+        std::cout << "[REGIONAL][CONTROL] ACK_PARAMS od " << drone_uri
+                  << " | altitude=" << msg.value("ALTITUDE", 0)
+                  << " speed=" << msg.value("SPEED", 0)
+                  << " direction=" << msg.value("DIRECTION", "")
+                  << std::endl;
+    }
     else if (type == "ACK_RTB")
     {
         // Potvrda da je dron primio komandu za povratak u bazu.
@@ -906,7 +991,14 @@ json handle_drone_message(json msg)
         json central_response = send_to_central(status_msg);
 
         response["TYPE"] = "ACK_RTB_SAVED";
+        response["DRONE_URI"] = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        response["STATUS"] = "RETURN_TO_BASE";
         response["CENTRAL_RESPONSE"] = central_response;
+
+        std::cout << "[REGIONAL][CONTROL] ACK_RTB od "
+                  << msg.value("DRONE_URI", "UNKNOWN_DRONE")
+                  << " | baza=" << msg.value("BASE_LAT", 0.0)
+                  << "," << msg.value("BASE_LON", 0.0) << std::endl;
     }
     else
     {
