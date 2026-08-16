@@ -1,13 +1,8 @@
 // regional_server.cpp
-// Regionalni server za autonomne dronove.
-// Registruje zone na centralni server, prima TCP kontrolne poruke i UDP telemetriju, čuva lokalni status,
-// validira zone i prosljeđuje zahtjeve centralnom serveru.
-// Ako centralni vrati RETURN_TO_BASE, regionalni komandu prosljeđuje dronu.
-// Ako centralni odobri misiju višeg prioriteta, regionalni ispiše koju je misiju preuzeo.
-// Watchdog detektuje gubitak telemetrije/keepalive-a nakon 45 s i prijavljuje CONNECTION_LOST.
-// INSPECTION_REPORT poruke prosljedjuje centralnom serveru preko TCP-a.
-// v8_stop_mission: regionalni pamti aktivne TCP konekcije dronova po DRONE_URI i
-// aktivno salje STOP_MISSION preemptovanom dronu kada centralni odobri misiju viseg prioriteta.
+// v9_scheduler: regionalni server posreduje izmedju centralnog servera, dronova i testnog mission clienta.
+// Dronovi se registruju kao AVAILABLE; centralni server dodjeljuje START_MISSION slobodnim dronovima.
+// Prioritet ne prekida aktivnu misiju. STOP_MISSION se koristi samo kao posebna kontrolna komanda.
+// Watchdog, UDP telemetrija/keepalive, INSPECTION i RTB ostaju podrzani.
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -129,6 +124,31 @@ bool send_to_drone(const std::string& drone_uri, const json& msg)
                   << drone_uri << " nije uspjelo: "
                   << e.what() << std::endl;
         return false;
+    }
+}
+
+void dispatch_assignments(const json& response)
+{
+    if (!response.contains("ASSIGNMENTS") || !response["ASSIGNMENTS"].is_array())
+        return;
+
+    for (const auto& command : response["ASSIGNMENTS"])
+    {
+        if (command.value("TYPE", "") != "START_MISSION")
+            continue;
+
+        std::string target = command.value("ASSIGNED_DRONE", "UNKNOWN_DRONE");
+        if (send_to_drone(target, command))
+        {
+            std::cout << "[REGIONAL][SCHEDULER] START_MISSION poslan dronu "
+                      << target << " | mission="
+                      << command.value("MISSION_ID", "UNKNOWN_MISSION") << std::endl;
+        }
+        else
+        {
+            std::cerr << "[REGIONAL][SCHEDULER] Nema aktivne TCP konekcije za "
+                      << target << "; zadatak nije isporucen." << std::endl;
+        }
     }
 }
 
@@ -552,10 +572,27 @@ json handle_drone_message(json msg)
             response["CENTRAL_RESPONSE"] = central_response;
         }
     }
-    else if (type == "MISSION_REQUEST")
+    else if (type == "DRONE_READY")
+    {
+        std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        json status_msg;
+        status_msg["TYPE"] = "DRONE_STATUS";
+        status_msg["DRONE_URI"] = drone_uri;
+        status_msg["BATTERY"] = msg.value("BATTERY", -1);
+        status_msg["STATUS"] = "AVAILABLE";
+        status_msg["LAT"] = msg.value("LAT", 0.0);
+        status_msg["LON"] = msg.value("LON", 0.0);
+        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        status_msg["ROUTE_ID"] = "";
+        save_drone_status(status_msg);
+
+        msg["TYPE"] = "DRONE_READY";
+        response = send_to_central(msg);
+        dispatch_assignments(response);
+    }
+    else if (type == "MISSION_SUBMIT" || type == "MISSION_REQUEST")
     {
         std::string zone = msg.value("ZONE", "");
-
         if (!is_valid_zone(zone))
         {
             response["TYPE"] = "MISSION_REJECTED";
@@ -564,50 +601,29 @@ json handle_drone_message(json msg)
         }
         else
         {
+            msg["TYPE"] = "MISSION_SUBMIT";
             response = send_to_central(msg);
-
-            if (!response.value("PREEMPTED_DRONE", "").empty())
+            dispatch_assignments(response);
+        }
+    }
+    else if (type == "STOP_MISSION_REQUEST")
+    {
+        response = send_to_central(msg);
+        if (response.value("TYPE", "") == "STOP_MISSION_DISPATCH")
+        {
+            std::string target = response.value("TARGET_DRONE", "UNKNOWN_DRONE");
+            json command;
+            if (response.contains("COMMAND"))
+                command = response["COMMAND"];
+            if (!send_to_drone(target, command))
             {
-                std::string preempted_drone =
-                    response.value("PREEMPTED_DRONE", "UNKNOWN_DRONE");
-                std::string preempted_mission_id =
-                    response.value("PREEMPTED_MISSION_ID", "UNKNOWN_MISSION");
-
-                std::cout << "[REGIONAL] Centralni server je zbog prioriteta prekinuo misiju drona "
-                          << preempted_drone
-                          << " i dodijelio slot novoj misiji."
-                          << std::endl;
-
-                json stop_msg;
-                stop_msg["TYPE"] = "STOP_MISSION";
-                stop_msg["DRONE_URI"] = preempted_drone;
-                stop_msg["MISSION_ID"] = preempted_mission_id;
-                stop_msg["REASON"] = "PREEMPTED_BY_HIGHER_PRIORITY";
-                stop_msg["REPLACED_BY_MISSION_ID"] =
-                    response.value("MISSION_ID", "UNKNOWN_MISSION");
-
-                if (send_to_drone(preempted_drone, stop_msg))
-                {
-                    std::cout << "[REGIONAL] STOP_MISSION poslan dronu "
-                              << preempted_drone
-                              << " za misiju " << preempted_mission_id
-                              << std::endl;
-                }
-                else
-                {
-                    std::cerr << "[REGIONAL] Preemptovani dron "
-                              << preempted_drone
-                              << " nema aktivnu TCP konekciju; STOP_MISSION nije isporucen."
-                              << std::endl;
-
-                    json alarm;
-                    alarm["TYPE"] = "ALARM";
-                    alarm["DRONE_URI"] = preempted_drone;
-                    alarm["ALARM_TYPE"] = "STOP_MISSION_DELIVERY_FAILED";
-                    alarm["MESSAGE"] = "No active TCP connection for preempted drone";
-                    alarm["MISSION_ID"] = preempted_mission_id;
-                    send_to_central(alarm);
-                }
+                response["TYPE"] = "STOP_MISSION_DELIVERY_FAILED";
+                response["REASON"] = "TARGET_DRONE_NOT_CONNECTED";
+            }
+            else
+            {
+                std::cout << "[REGIONAL] STOP_MISSION poslan dronu " << target
+                          << " na zahtjev operatora." << std::endl;
             }
         }
     }
@@ -623,6 +639,7 @@ json handle_drone_message(json msg)
     else if (type == "MISSION_FINISHED")
     {
         response = send_to_central(msg);
+        dispatch_assignments(response);
     }
     else if (type == "ACK_STOP")
     {
@@ -644,6 +661,7 @@ json handle_drone_message(json msg)
         save_drone_status(status_msg);
 
         response = send_to_central(msg);
+        dispatch_assignments(response);
     }
     else if (type == "ACK_RTB")
     {
