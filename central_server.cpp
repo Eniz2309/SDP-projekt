@@ -1,6 +1,8 @@
 // v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
 // v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
 // v9_scheduler: prioriteti se primjenjuju na RED CEKANJA ZADATAKA i raspolozivost dronova.
+// v10_formation: formacijski let koristi REGIONALNI SERVER kao VIRTUAL_LEADER/FORMATION_CONTROLLER.
+// Svi clanovi formacije koriste isti visinski nivo, a razdvojeni su horizontalnim offsetima.
 // Dronovi se registruju kao AVAILABLE, centralni server dodjeljuje zadatke slobodnim dronovima.
 // Nema automatskog preemptiona zbog prioriteta; STOP_MISSION ostaje posebna kontrolna komanda.
 // central_server.cpp
@@ -15,6 +17,7 @@
 // - LOW_BATTERY alarm automatski generiše RETURN_TO_BASE komandu
 // - prioritetni red zadataka (MONITORING > DELIVERY > INSPECTION > TEST_FLIGHT)
 // - dodjela zadataka slobodnim dronovima; rute i kapacitet su odvojena logika
+// - FORMATION: 2-5 slobodnih dronova, isti altitude, horizontalni razmak, server kao virtual leader
 
 #include <boost/asio.hpp>
 #include <iostream>
@@ -186,6 +189,26 @@ void init_database()
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS formation_requests (
+            mission_id TEXT PRIMARY KEY,
+            formation_size INTEGER NOT NULL,
+            spacing_m REAL NOT NULL
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS formation_members (
+            mission_id TEXT,
+            drone_uri TEXT,
+            member_index INTEGER,
+            offset_north_m REAL,
+            offset_east_m REAL,
+            status TEXT,
+            PRIMARY KEY(mission_id, drone_uri)
+        );
+    )");
 }
 
 LocalPoint latlon_to_offset(double center_lat, double center_lon, double lat, double lon)
@@ -278,6 +301,11 @@ int get_mission_priority(const std::string& mission_type)
 
     if (mission_type == "TEST_FLIGHT")
         return 1;
+
+    // FORMATION je poseban serverski kontrolisan zadatak.
+    // Ne mijenja trazeni red 4>3>2>1 za osnovne misije; dijeli nivo sa INSPECTION.
+    if (mission_type == "FORMATION")
+        return 2;
 
     return 0;
 }
@@ -662,6 +690,66 @@ json handle_ack_stop(const json& msg)
         return response;
     }
 
+    std::string mission_type;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id);
+        q.fetch(mission_type);
+    }
+
+    if (mission_type == "FORMATION")
+    {
+        int remaining = 0;
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+
+            auto member_stmt = g_db->prepare(R"(
+                UPDATE formation_members
+                SET status = 'STOPPED'
+                WHERE mission_id = ? AND drone_uri = ?;
+            )");
+            member_stmt.execute(mission_id, drone_uri);
+
+            auto drone_stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            drone_stmt.execute(drone_uri);
+
+            auto count_stmt = g_db->prepare(R"(
+                SELECT COUNT(*) FROM formation_members
+                WHERE mission_id = ? AND status != 'STOPPED';
+            )");
+            count_stmt.execute(mission_id);
+            count_stmt.fetch(remaining);
+
+            if (remaining == 0)
+            {
+                auto mission_stmt = g_db->prepare(R"(
+                    UPDATE missions
+                    SET status = 'STOPPED', finished_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ? AND status IN ('ACTIVE', 'STOP_REQUESTED');
+                )");
+                mission_stmt.execute(mission_id);
+            }
+        }
+
+        response["TYPE"] = "ACK_STOP_SAVED";
+        response["MISSION_ID"] = mission_id;
+        response["DRONE_URI"] = drone_uri;
+        response["REGION_ID"] = region_id;
+        response["FORMATION_REMAINING"] = remaining;
+        response["FORMATION_STOPPED"] = (remaining == 0);
+        response["ASSIGNMENTS"] = (remaining == 0) ? schedule_region(region_id) : json::array();
+
+        std::cout << "[CENTRAL][FORMATION] ACK_STOP " << drone_uri
+                  << " | mission=" << mission_id
+                  << " | remaining=" << remaining << std::endl;
+        return response;
+    }
+
     {
         std::lock_guard<std::mutex> lock(db_mutex);
 
@@ -894,6 +982,75 @@ bool get_available_drone(const std::string& region_id, std::string& drone_uri)
     return stmt.fetch(drone_uri);
 }
 
+
+std::vector<std::string> get_available_drones(const std::string& region_id, int count)
+{
+    std::vector<std::string> drones;
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        SELECT drone_uri
+        FROM drones
+        WHERE region_id = ?
+          AND status = 'AVAILABLE'
+          AND battery > 20
+        ORDER BY last_seen ASC;
+    )");
+    stmt.execute(region_id);
+    std::string drone_uri;
+    while (stmt.fetch(drone_uri))
+    {
+        drones.push_back(drone_uri);
+        if (static_cast<int>(drones.size()) >= count)
+            break;
+    }
+    return drones;
+}
+
+std::string get_mission_type_by_id(const std::string& mission_id)
+{
+    std::string type;
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+    stmt.execute(mission_id);
+    stmt.fetch(type);
+    return type;
+}
+
+bool get_formation_request(const std::string& mission_id, int& formation_size, double& spacing_m)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(
+        "SELECT formation_size FROM formation_requests WHERE mission_id = ?;"
+    );
+    stmt.execute(mission_id);
+    if (!stmt.fetch(formation_size))
+        return false;
+
+    stmt = g_db->prepare(
+        "SELECT spacing_m FROM formation_requests WHERE mission_id = ?;"
+    );
+    stmt.execute(mission_id);
+    stmt.fetch(spacing_m);
+    return true;
+}
+
+json get_formation_member_uris(const std::string& mission_id)
+{
+    json result = json::array();
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        SELECT drone_uri
+        FROM formation_members
+        WHERE mission_id = ?
+        ORDER BY member_index ASC;
+    )");
+    stmt.execute(mission_id);
+    std::string drone_uri;
+    while (stmt.fetch(drone_uri))
+        result.push_back(drone_uri);
+    return result;
+}
+
 std::vector<std::string> get_queued_mission_ids(const std::string& region_id)
 {
     std::vector<std::string> ids;
@@ -1048,6 +1205,136 @@ bool build_assignment(const std::string& mission_id,
     return true;
 }
 
+
+bool build_formation_assignment(const std::string& mission_id, json& commands)
+{
+    std::string region_id, zone, route_id;
+    int mission_priority = 0;
+    int requested_altitude = 120;
+    int formation_size = 3;
+    double spacing_m = 10.0;
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT region_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); if (!q.fetch(region_id)) return false;
+        q = g_db->prepare("SELECT mission_priority FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(mission_priority);
+        q = g_db->prepare("SELECT zone FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(zone);
+        q = g_db->prepare("SELECT route_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(route_id);
+        q = g_db->prepare("SELECT altitude FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(requested_altitude);
+    }
+
+    if (!get_formation_request(mission_id, formation_size, spacing_m))
+        return false;
+
+    std::vector<std::string> members = get_available_drones(region_id, formation_size);
+    if (static_cast<int>(members.size()) < formation_size)
+        return false;
+
+    ZoneInfo zone_info = get_zone_info(region_id, zone);
+    if (!zone_info.found)
+        return false;
+
+    if (route_id.empty() || route_id == "AUTO")
+        route_id = zone + "_K1";
+
+    RouteInfo route = get_route_info(region_id, zone, route_id);
+    if (!route.found)
+        return false;
+
+    // Cijela formacija zauzima JEDAN logicki visinski slot na ruti.
+    // Svi clanovi dobijaju potpuno isti altitude.
+    int formation_altitude = 0;
+    int formation_slot = -1;
+    if (!assign_altitude_slot(region_id, zone, route_id, route,
+                              requested_altitude, formation_altitude, formation_slot))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET drone_uri = ?, route_id = ?, altitude = ?, altitude_slot = ?,
+                status = 'ACTIVE'
+            WHERE mission_id = ? AND status = 'QUEUED';
+        )");
+        // drone_uri je samo reprezentativni clan radi kompatibilnosti sa starijom semom.
+        mission_stmt.execute(members.front(), route_id, formation_altitude,
+                             formation_slot, mission_id);
+
+        auto del = g_db->prepare("DELETE FROM formation_members WHERE mission_id = ?;");
+        del.execute(mission_id);
+
+        auto member_stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO formation_members
+            (mission_id, drone_uri, member_index, offset_north_m, offset_east_m, status)
+            VALUES (?, ?, ?, ?, ?, 'ACTIVE');
+        )");
+
+        auto drone_stmt = g_db->prepare(R"(
+            UPDATE drones
+            SET status = 'BUSY', route_id = ?, altitude = ?, last_seen = CURRENT_TIMESTAMP
+            WHERE drone_uri = ? AND status = 'AVAILABLE';
+        )");
+
+        const double center_index = (formation_size - 1) / 2.0;
+        for (int i = 0; i < formation_size; ++i)
+        {
+            // Line-abreast: svi su na istom nivou, razmaknuti lijevo/desno.
+            double offset_north_m = 0.0;
+            double offset_east_m = (i - center_index) * spacing_m;
+
+            member_stmt.execute(mission_id, members[i], i,
+                                offset_north_m, offset_east_m);
+            drone_stmt.execute(route_id, formation_altitude, members[i]);
+        }
+    }
+
+    commands = json::array();
+    const double center_index = (formation_size - 1) / 2.0;
+    for (int i = 0; i < formation_size; ++i)
+    {
+        json command;
+        command["TYPE"] = "START_FORMATION";
+        command["MISSION_ID"] = mission_id;
+        command["MISSION_TYPE"] = "FORMATION";
+        command["MISSION_PRIORITY"] = mission_priority;
+        command["ASSIGNED_DRONE"] = members[i];
+        command["DRONE_URI"] = members[i];
+        command["ZONE"] = zone;
+        command["ROUTE_ID"] = route_id;
+        command["ROUTE_TYPE"] = route.route_type;
+        command["CONTOUR_LEVEL"] = route.contour_level;
+        command["CENTER_LAT"] = zone_info.center_lat;
+        command["CENTER_LON"] = zone_info.center_lon;
+        command["HALF_SIZE_M"] = route.half_size_m;
+        command["ALTITUDE"] = formation_altitude;
+        command["ALTITUDE_SLOT"] = formation_slot;
+        command["FORMATION_SIZE"] = formation_size;
+        command["FORMATION_MEMBER_INDEX"] = i;
+        command["OFFSET_NORTH_M"] = 0.0;
+        command["OFFSET_EAST_M"] = (i - center_index) * spacing_m;
+        command["FORMATION_SPACING_M"] = spacing_m;
+        command["FORMATION_CONTROLLER"] = "REGIONAL_SERVER";
+        command["VIRTUAL_LEADER"] = true;
+        command["SAME_ALTITUDE"] = true;
+        commands.push_back(command);
+    }
+
+    std::cout << "[CENTRAL][FORMATION] " << mission_id
+              << " -> " << formation_size << " dronova"
+              << " | route=" << route_id
+              << " | zajednicka visina=" << formation_altitude
+              << "m | spacing=" << spacing_m << "m" << std::endl;
+
+    return true;
+}
+
 json schedule_region(const std::string& region_id)
 {
     // Scheduler je serijalizovan da dvije paralelne sesije ne dodijele isti AVAILABLE dron.
@@ -1056,25 +1343,42 @@ json schedule_region(const std::string& region_id)
 
     for (;;)
     {
-        std::string drone_uri;
-        if (!get_available_drone(region_id, drone_uri))
-            break;
-
         std::vector<std::string> queued = get_queued_mission_ids(region_id);
         if (queued.empty())
             break;
 
         bool assigned = false;
-        // Red je vec sortiran po PRIORITY DESC, pa se bira prvi zadatak
-        // koji trenutno moze dobiti sigurnu rutu/visinski slot.
+
+        // Prioritet je vec DESC. Ako FORMATION nema dovoljno slobodnih dronova,
+        // scheduler moze probati sljedecu misiju umjesto da blokira cijeli red.
         for (const auto& mission_id : queued)
         {
-            json command;
-            if (build_assignment(mission_id, drone_uri, command))
+            std::string mission_type = get_mission_type_by_id(mission_id);
+
+            if (mission_type == "FORMATION")
             {
-                assignments.push_back(command);
-                assigned = true;
-                break;
+                json formation_commands;
+                if (build_formation_assignment(mission_id, formation_commands))
+                {
+                    for (const auto& command : formation_commands)
+                        assignments.push_back(command);
+                    assigned = true;
+                    break;
+                }
+            }
+            else
+            {
+                std::string drone_uri;
+                if (!get_available_drone(region_id, drone_uri))
+                    continue;
+
+                json command;
+                if (build_assignment(mission_id, drone_uri, command))
+                {
+                    assignments.push_back(command);
+                    assigned = true;
+                    break;
+                }
             }
         }
 
@@ -1121,6 +1425,8 @@ json handle_mission_submit(const json& msg)
     int requested_altitude = msg.value("ALTITUDE", 120);
     double delivery_lat = msg.value("DELIVERY_LAT", 0.0);
     double delivery_lon = msg.value("DELIVERY_LON", 0.0);
+    int formation_size = msg.value("FORMATION_SIZE", 3);
+    double formation_spacing_m = msg.value("FORMATION_SPACING_M", 10.0);
     int priority = get_mission_priority(mission_type);
 
     if (mission_id.empty() || priority == 0)
@@ -1150,6 +1456,15 @@ json handle_mission_submit(const json& msg)
         response["REASON"] = "MISSING_DELIVERY_POINT";
         return response;
     }
+    if (mission_type == "FORMATION" &&
+        (formation_size < 2 || formation_size > 5 ||
+         formation_spacing_m < 2.0 || formation_spacing_m > 100.0))
+    {
+        response["TYPE"] = "MISSION_REJECTED";
+        response["MISSION_ID"] = mission_id;
+        response["REASON"] = "INVALID_FORMATION_PARAMETERS";
+        return response;
+    }
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
@@ -1161,6 +1476,16 @@ json handle_mission_submit(const json& msg)
         )");
         stmt.execute(mission_id, region_id, mission_type, priority, zone, route_id,
                      requested_altitude, delivery_lat, delivery_lon);
+
+        if (mission_type == "FORMATION")
+        {
+            auto f = g_db->prepare(R"(
+                INSERT OR REPLACE INTO formation_requests
+                (mission_id, formation_size, spacing_m)
+                VALUES (?, ?, ?);
+            )");
+            f.execute(mission_id, formation_size, formation_spacing_m);
+        }
     }
 
     json assignments = schedule_region(region_id);
@@ -1179,8 +1504,17 @@ json handle_mission_submit(const json& msg)
     response["MISSION_TYPE"] = mission_type;
     response["MISSION_PRIORITY"] = priority;
     response["STATUS"] = current_status;
-    response["ASSIGNED_DRONE"] = assigned_drone;
+    response["ASSIGNED_DRONE"] = (mission_type == "FORMATION") ? "" : assigned_drone;
     response["ASSIGNMENTS"] = assignments;
+
+    if (mission_type == "FORMATION")
+    {
+        response["ASSIGNED_DRONES"] = get_formation_member_uris(mission_id);
+        response["FORMATION_SIZE"] = formation_size;
+        response["FORMATION_SPACING_M"] = formation_spacing_m;
+        response["FORMATION_CONTROLLER"] = "REGIONAL_SERVER";
+        response["SAME_ALTITUDE"] = true;
+    }
 
     std::cout << "[CENTRAL] Zadatak primljen: " << mission_id
               << " | type=" << mission_type << " | priority=" << priority
@@ -1199,7 +1533,7 @@ json handle_stop_mission_request(const json& msg)
         return response;
     }
 
-    std::string drone_uri, region_id, status;
+    std::string drone_uri, region_id, status, mission_type;
     {
         std::lock_guard<std::mutex> lock(db_mutex);
         auto q = g_db->prepare("SELECT drone_uri FROM missions WHERE mission_id = ?;");
@@ -1213,6 +1547,8 @@ json handle_stop_mission_request(const json& msg)
         q.execute(mission_id); q.fetch(region_id);
         q = g_db->prepare("SELECT status FROM missions WHERE mission_id = ?;");
         q.execute(mission_id); q.fetch(status);
+        q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(mission_type);
 
         if (status == "QUEUED")
         {
@@ -1235,6 +1571,38 @@ json handle_stop_mission_request(const json& msg)
 
         auto u = g_db->prepare("UPDATE missions SET status = 'STOP_REQUESTED' WHERE mission_id = ?;");
         u.execute(mission_id);
+    }
+
+    if (mission_type == "FORMATION")
+    {
+        json commands = json::array();
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto q = g_db->prepare(R"(
+                SELECT drone_uri
+                FROM formation_members
+                WHERE mission_id = ? AND status = 'ACTIVE'
+                ORDER BY member_index ASC;
+            )");
+            q.execute(mission_id);
+            std::string member;
+            while (q.fetch(member))
+            {
+                json command;
+                command["TYPE"] = "STOP_MISSION";
+                command["MISSION_ID"] = mission_id;
+                command["DRONE_URI"] = member;
+                command["REASON"] = "OPERATOR_REQUEST";
+                command["FORMATION"] = true;
+                commands.push_back(command);
+            }
+        }
+
+        response["TYPE"] = "STOP_FORMATION_DISPATCH";
+        response["MISSION_ID"] = mission_id;
+        response["COMMANDS"] = commands;
+        response["REGION_ID"] = region_id;
+        return response;
     }
 
     json command;
