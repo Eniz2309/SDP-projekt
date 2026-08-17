@@ -21,6 +21,7 @@
 // - FORMATION: 2-5 slobodnih dronova, isti altitude, horizontalni razmak, server kao virtual leader
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -33,8 +34,10 @@
 #include <sqlite3.h>
 #include "json/json.h"
 #include "sqlite3_wrapper.h"
+#include "pqc_tls_utils.h"
 
 using boost::asio::ip::tcp;
+namespace ssl = boost::asio::ssl;
 using json = nlohmann::json;
 namespace sqlite = sqlite3_wrapper;
 
@@ -1857,14 +1860,29 @@ json handle_stop_mission_request(const json& msg)
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
-    explicit Session(tcp::socket socket)
-        : socket_(std::move(socket))
+    Session(tcp::socket socket, ssl::context& context)
+        : stream_(std::move(socket), context)
     {
     }
 
     void start()
     {
-        read_message();
+        auto self = shared_from_this();
+        stream_.async_handshake(ssl::stream_base::server,
+            [this, self](boost::system::error_code ec)
+            {
+                if (!ec)
+                {
+                    sdpsec::print_tls_session(stream_.native_handle(),
+                                              "[CENTRAL][PQC]");
+                    read_message();
+                }
+                else
+                {
+                    std::cerr << "[CENTRAL][PQC] TLS handshake error: "
+                              << ec.message() << std::endl;
+                }
+            });
     }
 
 private:
@@ -1872,7 +1890,7 @@ private:
     {
         auto self = shared_from_this();
 
-        boost::asio::async_read_until(socket_, buffer_, "\n",
+        boost::asio::async_read_until(stream_, buffer_, "\n",
             [this, self](boost::system::error_code ec, std::size_t)
             {
                 if (!ec)
@@ -1972,7 +1990,7 @@ private:
         auto self = shared_from_this();
         auto out = std::make_shared<std::string>(message);
 
-        boost::asio::async_write(socket_, boost::asio::buffer(*out),
+        boost::asio::async_write(stream_, boost::asio::buffer(*out),
             [this, self, out](boost::system::error_code ec, std::size_t)
             {
                 if (ec)
@@ -1984,16 +2002,21 @@ private:
     }
 
 private:
-    tcp::socket socket_;
+    ssl::stream<tcp::socket> stream_;
     boost::asio::streambuf buffer_;
 };
 
 class CentralServer
 {
 public:
-    CentralServer(boost::asio::io_context& io_context, short port)
-        : acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
+    CentralServer(boost::asio::io_context& io_context,
+                  short port,
+                  const std::string& cert_file,
+                  const std::string& key_file)
+        : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
+          context_(ssl::context::tls_server)
     {
+        sdpsec::configure_pqc_server(context_, cert_file, key_file);
         accept_connection();
     }
 
@@ -2006,7 +2029,7 @@ private:
                 if (!ec)
                 {
                     std::cout << "[CENTRAL] Regionalni server povezan.\n";
-                    std::make_shared<Session>(std::move(socket))->start();
+                    std::make_shared<Session>(std::move(socket), context_)->start();
                 }
 
                 accept_connection();
@@ -2015,13 +2038,14 @@ private:
 
 private:
     tcp::acceptor acceptor_;
+    ssl::context context_;
 };
 
 int main(int argc, char* argv[])
 {
-    if (argc != 2)
+    if (argc != 2 && argc != 4)
     {
-        std::cerr << "Usage: ./central_server <port>\n";
+        std::cerr << "Usage: ./central_server <port> [pqc_cert.pem pqc_key.pem]\n";
         return 1;
     }
 
@@ -2030,11 +2054,16 @@ int main(int argc, char* argv[])
         g_db.reset(new sqlite::db("central_server.db"));
         init_database();
 
+        const std::string cert_file =
+            (argc == 4) ? argv[2] : sdpsec::env_or("SDP_CENTRAL_CERT", "central-cert.pem");
+        const std::string key_file =
+            (argc == 4) ? argv[3] : sdpsec::env_or("SDP_CENTRAL_KEY", "central-key.pem");
+
         boost::asio::io_context io_context;
-        CentralServer server(io_context, std::atoi(argv[1]));
+        CentralServer server(io_context, std::atoi(argv[1]), cert_file, key_file);
 
         std::cout << "[CENTRAL] Centralni server pokrenut na portu "
-                  << argv[1] << std::endl;
+                  << argv[1] << " | TLS1.3 + X25519MLKEM768 + ML-DSA-44" << std::endl;
 
         io_context.run();
     }
