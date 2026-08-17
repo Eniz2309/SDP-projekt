@@ -6,8 +6,11 @@
 // Dronovi se registruju kao AVAILABLE; centralni server dodjeljuje START_MISSION slobodnim dronovima.
 // Prioritet ne prekida aktivnu misiju. STOP_MISSION se koristi samo kao posebna kontrolna komanda.
 // Watchdog, UDP telemetrija/keepalive, INSPECTION i RTB ostaju podrzani.
+// v12_pqc_tls: svi TCP kanali koriste TLS 1.3 + X25519MLKEM768 + ML-DSA-44.
+// UDP TELEMETRY/KEEPALIVE koristi AES-256-GCM sa ključem izvedenim iz PQC TLS sesije.
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -27,8 +30,11 @@
 #include <sqlite3.h>
 #include "json/json.h"
 #include "sqlite3_wrapper.h"
+#include "pqc_tls_utils.h"
+#include "udp_aead.h"
 
 using boost::asio::ip::tcp;
+namespace ssl = boost::asio::ssl;
 using boost::asio::ip::udp;
 using json = nlohmann::json;
 namespace sqlite = sqlite3_wrapper;
@@ -51,7 +57,9 @@ std::unique_ptr<sqlite::db> g_db;
 std::mutex db_mutex;
 
 boost::asio::io_context central_io;
-std::unique_ptr<tcp::socket> central_socket;
+std::unique_ptr<ssl::context> central_tls_context;
+std::unique_ptr<ssl::stream<tcp::socket>> central_stream;
+std::unique_ptr<ssl::context> drone_tls_context;
 std::mutex central_mutex;
 
 // Aktivne TCP konekcije dronova.
@@ -60,11 +68,13 @@ std::mutex central_mutex;
 // write_mutex sprjecava da se dvije TCP poruke istovremeno upisuju na isti socket.
 struct DroneConnection
 {
-    std::shared_ptr<tcp::socket> socket;
+    std::shared_ptr<ssl::stream<tcp::socket>> stream;
+    std::array<unsigned char, 32> udp_key;
     std::mutex write_mutex;
 
-    explicit DroneConnection(const std::shared_ptr<tcp::socket>& s)
-        : socket(s)
+    DroneConnection(const std::shared_ptr<ssl::stream<tcp::socket>>& s,
+                    const std::array<unsigned char, 32>& key)
+        : stream(s), udp_key(key)
     {
     }
 };
@@ -120,7 +130,7 @@ bool send_to_drone(const std::string& drone_uri, const json& msg)
     {
         std::string out = msg.dump() + "\n";
         std::lock_guard<std::mutex> write_lock(connection->write_mutex);
-        boost::asio::write(*connection->socket, boost::asio::buffer(out));
+        boost::asio::write(*connection->stream, boost::asio::buffer(out));
         return true;
     }
     catch (const std::exception& e)
@@ -696,10 +706,10 @@ json send_to_central(json msg)
 
     std::string request = msg.dump() + "\n";
 
-    boost::asio::write(*central_socket, boost::asio::buffer(request));
+    boost::asio::write(*central_stream, boost::asio::buffer(request));
 
     boost::asio::streambuf buffer;
-    boost::asio::read_until(*central_socket, buffer, "\n");
+    boost::asio::read_until(*central_stream, buffer, "\n");
 
     std::istream is(&buffer);
     std::string response;
@@ -1020,7 +1030,7 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
         for (;;)
         {
             boost::system::error_code ec;
-            boost::asio::read_until(*connection->socket, buffer, "\n", ec);
+            boost::asio::read_until(*connection->stream, buffer, "\n", ec);
 
             if (ec)
             {
@@ -1054,7 +1064,7 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
             std::string out = response.dump() + "\n";
             {
                 std::lock_guard<std::mutex> write_lock(connection->write_mutex);
-                boost::asio::write(*connection->socket, boost::asio::buffer(out));
+                boost::asio::write(*connection->stream, boost::asio::buffer(out));
             }
         }
     }
@@ -1103,7 +1113,43 @@ void start_udp_server(unsigned short port)
             try
             {
                 std::string received(data.data(), length);
-                json msg = json::parse(received);
+                json envelope = json::parse(received);
+
+                if (envelope.value("TYPE", "") != "PQC_UDP")
+                {
+                    std::cerr << "[REGIONAL][UDP][SECURITY] Odbijen nešifrovan UDP datagram."
+                              << std::endl;
+                    continue;
+                }
+
+                const std::string drone_uri =
+                    envelope.value("DRONE_URI", "UNKNOWN_DRONE");
+
+                std::shared_ptr<DroneConnection> connection;
+                {
+                    std::lock_guard<std::mutex> lock(drone_connections_mutex);
+                    auto it = drone_connections.find(drone_uri);
+                    if (it != drone_connections.end())
+                        connection = it->second;
+                }
+
+                if (!connection)
+                {
+                    std::cerr << "[REGIONAL][UDP][SECURITY] Nema aktivnog PQC TLS ključa za "
+                              << drone_uri << std::endl;
+                    continue;
+                }
+
+                json msg = sdpsec::decrypt_udp_envelope(envelope,
+                                                        connection->udp_key);
+
+                if (msg.value("DRONE_URI", "") != drone_uri)
+                {
+                    std::cerr << "[REGIONAL][UDP][SECURITY] DRONE_URI mismatch."
+                              << std::endl;
+                    continue;
+                }
+
                 std::string original_type = msg.value("TYPE", "UNKNOWN");
 
                 if (original_type != "KEEPALIVE" && original_type != "TELEMETRY")
@@ -1113,12 +1159,11 @@ void start_udp_server(unsigned short port)
                     continue;
                 }
 
-                std::cout << "[REGIONAL][UDP] " << original_type
-                          << " od " << msg.value("DRONE_URI", "UNKNOWN_DRONE")
+                std::cout << "[REGIONAL][UDP][AES-256-GCM] " << original_type
+                          << " od " << drone_uri
                           << " | " << sender_endpoint.address().to_string()
                           << ":" << sender_endpoint.port() << std::endl;
 
-                // Centralni vec ocekuje DRONE_STATUS format.
                 msg["TYPE"] = "DRONE_STATUS";
                 save_drone_status(msg);
                 send_to_central(msg);
@@ -1142,18 +1187,35 @@ void start_drone_server(unsigned short port)
     boost::asio::io_context io_context;
     tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), port));
 
-    std::cout << "[REGIONAL] Regionalni server sluša dronove na portu "
+    std::cout << "[REGIONAL] PQC TLS server sluša dronove/operatora na portu "
               << port << std::endl;
 
     for (;;)
     {
-        auto socket = std::make_shared<tcp::socket>(io_context);
-        acceptor.accept(*socket);
+        try
+        {
+            auto stream =
+                std::make_shared<ssl::stream<tcp::socket>>(io_context,
+                                                           *drone_tls_context);
 
-        std::cout << "[REGIONAL] Dron povezan na regionalni server.\n";
+            acceptor.accept(stream->next_layer());
+            stream->handshake(ssl::stream_base::server);
 
-        auto connection = std::make_shared<DroneConnection>(socket);
-        std::thread(drone_session, connection).detach();
+            sdpsec::print_tls_session(stream->native_handle(),
+                                      "[REGIONAL][PQC][CLIENT]");
+
+            const auto udp_key =
+                sdpsec::export_udp_key(stream->native_handle());
+
+            auto connection =
+                std::make_shared<DroneConnection>(stream, udp_key);
+            std::thread(drone_session, connection).detach();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "[REGIONAL][PQC] TLS accept/handshake error: "
+                      << e.what() << std::endl;
+        }
     }
 }
 
@@ -1162,10 +1224,15 @@ void connect_to_central(const std::string& host, const std::string& port)
     tcp::resolver resolver(central_io);
     auto endpoints = resolver.resolve(host, port);
 
-    central_socket.reset(new tcp::socket(central_io));
-    boost::asio::connect(*central_socket, endpoints);
+    central_stream.reset(
+        new ssl::stream<tcp::socket>(central_io, *central_tls_context));
 
-    std::cout << "[REGIONAL] Regionalni server povezan na centralni server.\n";
+    boost::asio::connect(central_stream->next_layer(), endpoints);
+    central_stream->handshake(ssl::stream_base::client);
+
+    sdpsec::print_tls_session(central_stream->native_handle(),
+                              "[REGIONAL][PQC][CENTRAL]");
+    std::cout << "[REGIONAL] Regionalni server povezan na centralni server preko PQC TLS-a.\n";
 
     json register_msg;
     register_msg["TYPE"] = "REGION_REGISTER";
@@ -1229,6 +1296,21 @@ int main(int argc, char* argv[])
         init_database();
         save_zones();
         print_zones();
+
+        const std::string central_cert =
+            sdpsec::env_or("SDP_CENTRAL_CERT", "central-cert.pem");
+        const std::string regional_cert =
+            sdpsec::env_or("SDP_REGIONAL_CERT", "regional-cert.pem");
+        const std::string regional_key =
+            sdpsec::env_or("SDP_REGIONAL_KEY", "regional-key.pem");
+
+        central_tls_context.reset(new ssl::context(ssl::context::tls_client));
+        sdpsec::configure_pqc_client(*central_tls_context, central_cert);
+
+        drone_tls_context.reset(new ssl::context(ssl::context::tls_server));
+        sdpsec::configure_pqc_server(*drone_tls_context,
+                                     regional_cert,
+                                     regional_key);
 
         connect_to_central(central_host, central_port);
 
