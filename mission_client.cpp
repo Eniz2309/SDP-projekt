@@ -1,28 +1,39 @@
 // mission_client.cpp
 // Operator/test CLI.
 // v11: SUBMIT, STOP, PARAMS i rucni RTB.
-
+// v12: operator<->regionalni kanal je PQC TLS 1.3.\n
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <string>
 #include <cstdlib>
 #include "json/json.h"
+#include "pqc_tls_utils.h"
 
 using boost::asio::ip::tcp;
+namespace ssl = boost::asio::ssl;
 using json = nlohmann::json;
 
 json transact(const std::string& host, const std::string& port, const json& request)
 {
     boost::asio::io_context io;
+    ssl::context ctx(ssl::context::tls_client);
+    const std::string regional_cert =
+        sdpsec::env_or("SDP_REGIONAL_CERT", "regional-cert.pem");
+    sdpsec::configure_pqc_client(ctx, regional_cert);
+
     tcp::resolver resolver(io);
-    tcp::socket socket(io);
-    boost::asio::connect(socket, resolver.resolve(host, port));
+    ssl::stream<tcp::socket> stream(io, ctx);
+    boost::asio::connect(stream.next_layer(), resolver.resolve(host, port));
+    stream.handshake(ssl::stream_base::client);
+
+    sdpsec::print_tls_session(stream.native_handle(), "[MISSION_CLIENT][PQC]");
 
     std::string out = request.dump() + "\n";
-    boost::asio::write(socket, boost::asio::buffer(out));
+    boost::asio::write(stream, boost::asio::buffer(out));
 
     boost::asio::streambuf buffer;
-    boost::asio::read_until(socket, buffer, "\n");
+    boost::asio::read_until(stream, buffer, "\n");
     std::istream is(&buffer);
     std::string line;
     std::getline(is, line);
