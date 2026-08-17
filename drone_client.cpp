@@ -5,9 +5,11 @@
 // Svi clanovi formacije lete na istoj visini i dobijaju horizontalne targete od servera.
 // Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
 // TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
+// v12_pqc_tls: TCP je TLS1.3/X25519MLKEM768/ML-DSA-44; UDP payload je AES-256-GCM.
 // Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, FORMATION, RTB i STOP_MISSION.
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <iostream>
 #include <string>
 #include <deque>
@@ -17,8 +19,11 @@
 #include <cstdlib>
 
 #include "json/json.h"
+#include "pqc_tls_utils.h"
+#include "udp_aead.h"
 
 using boost::asio::ip::tcp;
+namespace ssl = boost::asio::ssl;
 using boost::asio::ip::udp;
 using json = nlohmann::json;
 
@@ -43,9 +48,11 @@ public:
                 const std::string& udp_port,
                 const std::string& drone_uri,
                 const std::string& token,
-                int base_altitude)
+                int base_altitude,
+                const std::string& regional_cert)
         : io_(io),
-          socket_(io),
+          tls_context_(ssl::context::tls_client),
+          tls_stream_(io, tls_context_),
           resolver_(io),
           udp_socket_(io, udp::v4()),
           udp_resolver_(io),
@@ -80,33 +87,50 @@ public:
           low_battery_alarm_sent_(false),
           formation_mode_(false),
           formation_offset_north_m_(0.0),
-          formation_offset_east_m_(0.0)
+          formation_offset_east_m_(0.0),
+          udp_key_ready_(false)
     {
+        sdpsec::configure_pqc_client(tls_context_, regional_cert);
     }
 
     void start()
     {
-        // UDP endpoint se razrjesava jednom. UDP ne uspostavlja konekciju/handshake.
         auto udp_endpoints = udp_resolver_.resolve(udp::v4(), host_, udp_port_);
         udp_endpoint_ = *udp_endpoints.begin();
 
         auto endpoints = resolver_.resolve(host_, port_);
 
-        boost::asio::async_connect(socket_, endpoints,
+        boost::asio::async_connect(tls_stream_.next_layer(), endpoints,
             [this](boost::system::error_code ec, tcp::endpoint)
             {
-                if (!ec)
+                if (ec)
                 {
-                    std::cout << "[DRONE] Connected to regional server.\n";
-
-                    start_read();
-                    send_register();
-                }
-                else
-                {
-                    std::cerr << "[DRONE] Connection error: "
+                    std::cerr << "[DRONE][PQC] TCP connection error: "
                               << ec.message() << std::endl;
+                    return;
                 }
+
+                tls_stream_.async_handshake(ssl::stream_base::client,
+                    [this](boost::system::error_code hs_ec)
+                    {
+                        if (hs_ec)
+                        {
+                            std::cerr << "[DRONE][PQC] TLS handshake error: "
+                                      << hs_ec.message() << std::endl;
+                            return;
+                        }
+
+                        sdpsec::print_tls_session(tls_stream_.native_handle(),
+                                                  "[DRONE][PQC]");
+                        udp_key_ =
+                            sdpsec::export_udp_key(tls_stream_.native_handle());
+                        udp_key_ready_ = true;
+
+                        std::cout << "[DRONE] Secure connection to regional server established.\n";
+
+                        start_read();
+                        send_register();
+                    });
             });
     }
 
@@ -494,7 +518,7 @@ private:
 
     void start_read()
     {
-        boost::asio::async_read_until(socket_, read_buffer_, "\n",
+        boost::asio::async_read_until(tls_stream_, read_buffer_, "\n",
             [this](boost::system::error_code ec, std::size_t)
             {
                 if (!ec)
@@ -857,18 +881,34 @@ private:
                   << " direction=" << direction_ << std::endl;
     }
 
-    // UDP: jedan JSON objekat = jedan datagram. Nema \n delimiter-a niti ACK-a.
+    // UDP payload se štiti AES-256-GCM ključem izvedenim iz PQC TLS sesije.
     void send_udp_json(const json& msg)
     {
-        std::string data = msg.dump();
-
-        boost::system::error_code ec;
-        udp_socket_.send_to(boost::asio::buffer(data), udp_endpoint_, 0, ec);
-
-        if (ec)
+        if (!udp_key_ready_)
         {
-            std::cerr << "[DRONE] UDP send error: "
-                      << ec.message() << std::endl;
+            std::cerr << "[DRONE][UDP][SECURITY] PQC TLS exporter key nije spreman.\n";
+            return;
+        }
+
+        try
+        {
+            json envelope =
+                sdpsec::encrypt_udp_envelope(drone_uri_, msg, udp_key_);
+            std::string data = envelope.dump();
+
+            boost::system::error_code ec;
+            udp_socket_.send_to(boost::asio::buffer(data), udp_endpoint_, 0, ec);
+
+            if (ec)
+            {
+                std::cerr << "[DRONE] UDP send error: "
+                          << ec.message() << std::endl;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "[DRONE][UDP][SECURITY] Encryption error: "
+                      << e.what() << std::endl;
         }
     }
 
@@ -887,7 +927,7 @@ private:
 
     void do_write()
     {
-        boost::asio::async_write(socket_,
+        boost::asio::async_write(tls_stream_,
             boost::asio::buffer(write_queue_.front()),
             [this](boost::system::error_code ec, std::size_t)
             {
@@ -910,13 +950,16 @@ private:
 
 private:
     boost::asio::io_context& io_;
-    tcp::socket socket_;
+    ssl::context tls_context_;
+    ssl::stream<tcp::socket> tls_stream_;
     tcp::resolver resolver_;
     boost::asio::streambuf read_buffer_;
 
     udp::socket udp_socket_;
     udp::resolver udp_resolver_;
     udp::endpoint udp_endpoint_;
+    std::array<unsigned char, 32> udp_key_;
+    bool udp_key_ready_;
 
     boost::asio::steady_timer keepalive_timer_;
     boost::asio::steady_timer telemetry_timer_;
@@ -980,9 +1023,12 @@ int main(int argc, char* argv[])
     }
 
     int base_altitude = (argc >= 7) ? std::atoi(argv[6]) : 120;
+    const std::string regional_cert =
+        sdpsec::env_or("SDP_REGIONAL_CERT", "regional-cert.pem");
 
     boost::asio::io_context io;
-    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5], base_altitude);
+    DroneClient drone(io, argv[1], argv[2], argv[3], argv[4], argv[5],
+                      base_altitude, regional_cert);
     drone.start();
     io.run();
     return 0;
