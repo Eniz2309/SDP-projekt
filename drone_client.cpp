@@ -6,6 +6,7 @@
 // Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
 // TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
 // v12_pqc_tls: TCP je TLS1.3/X25519MLKEM768/ML-DSA-44; UDP payload je AES-256-GCM.
+// v13_auth: URI+TOKEN mora biti unaprijed provisioniran na centralnom serveru.
 // Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, FORMATION, RTB i STOP_MISSION.
 
 #include <boost/asio.hpp>
@@ -554,6 +555,18 @@ private:
             {
                 status_ = "REGISTERED";
                 send_auth();
+            }
+            else if (type == "REGISTER_ERROR")
+            {
+                status_ = "AUTH_FAILED";
+                std::cerr << "[DRONE][AUTH] Registration rejected: "
+                          << msg.value("REASON", "UNKNOWN_REASON") << std::endl;
+            }
+            else if (type == "AUTH_ERROR")
+            {
+                status_ = "AUTH_FAILED";
+                std::cerr << "[DRONE][AUTH] Authentication rejected: "
+                          << msg.value("REASON", "UNKNOWN_REASON") << std::endl;
             }
             else if (type == "AUTH_ACK")
             {
