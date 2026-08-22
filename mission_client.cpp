@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 13
+// AUTONOMNI DRONOVI - VERZIJA 14
 // Fajl: mission_client.cpp
-// Dodano: zadrzan operator CLI preko PQC TLS kanala i uskladjen
-//         sa centralizovanom autentifikacijom ostatka sistema.
+// Dodano: nema promjene operator CLI protokola; ostaje kompatibilan
+//         sa prosirenim registrom telemetrije na serverima.
 // ============================================================
 
 #include <boost/asio.hpp>

@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 13
+// AUTONOMNI DRONOVI - VERZIJA 14
 // Fajl: drone_client.cpp
-// Dodano: URI+TOKEN registracija i autentifikacija moraju biti
-//         potvrdene prije AVAILABLE stanja i slanja telemetrije.
+// Dodano: prosirena TELEMETRY/KEEPALIVE poruka sa aktivnom misijom,
+//         tipom misije, rezimom leta i simuliranim statusom senzora.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -75,6 +75,7 @@ public:
           speed_(10),
           direction_("NORTH"),
           status_("INIT"),
+          sensor_status_("OK"),
           current_waypoint_(0),
           current_inspection_point_(0),
           delivery_mode_(false),
@@ -142,6 +143,7 @@ private:
         msg["LAT"] = lat_;
         msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
+        add_telemetry_context(msg);
 
         send_json(msg);
     }
@@ -171,6 +173,37 @@ private:
             });
     }
 
+    std::string current_flight_mode() const
+    {
+        if (status_ == "RETURN_TO_BASE")
+            return "RTB";
+
+        if (status_ == "FORMATION" || formation_mode_)
+            return "FORMATION";
+
+        if (status_ == "ON_MISSION" || status_ == "DELIVERY_APPROACH" ||
+            status_ == "DELIVERING")
+            return "AUTONOMOUS";
+
+        if (status_ == "AVAILABLE")
+            return "STANDBY";
+
+        if (status_ == "INIT" || status_ == "REGISTERED" || status_ == "AUTH_FAILED")
+            return "GROUND";
+
+        return "UNKNOWN";
+    }
+
+    void add_telemetry_context(json& msg) const
+    {
+        msg["MISSION_ID"] = mission_id_;
+        msg["MISSION_TYPE"] = mission_type_;
+        msg["FLIGHT_MODE"] = current_flight_mode();
+        msg["SENSOR_STATUS"] = sensor_status_;
+        msg["SPEED"] = speed_;
+        msg["DIRECTION"] = direction_;
+    }
+
     void send_keepalive()
     {
         json msg;
@@ -182,6 +215,7 @@ private:
         msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
         msg["ROUTE_ID"] = active_route_id_;
+        add_telemetry_context(msg);
         if (formation_mode_)
         {
             msg["FORMATION_ID"] = formation_id_;
@@ -222,9 +256,8 @@ private:
         msg["LAT"] = lat_;
         msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
-        msg["SPEED"] = speed_;
-        msg["DIRECTION"] = direction_;
         msg["ROUTE_ID"] = active_route_id_;
+        add_telemetry_context(msg);
         if (formation_mode_)
         {
             msg["FORMATION_ID"] = formation_id_;
@@ -241,6 +274,10 @@ private:
                   << " lon=" << lon_
                   << " alt=" << altitude_
                   << " route=" << active_route_id_
+                  << " mission=" << (mission_id_.empty() ? "NONE" : mission_id_)
+                  << " type=" << (mission_type_.empty() ? "NONE" : mission_type_)
+                  << " mode=" << current_flight_mode()
+                  << " sensor=" << sensor_status_
                   << " battery=" << battery_ << "%"
                   << std::endl;
     }
@@ -300,6 +337,7 @@ private:
         msg["LON"] = lon_;
         msg["ALTITUDE"] = altitude_;
         msg["ROUTE_ID"] = "";
+        add_telemetry_context(msg);
         send_json(msg);
 
         std::cout << "[DRONE] Ready for assignment. STATUS=AVAILABLE" << std::endl;
@@ -314,15 +352,31 @@ private:
         status_ = "AVAILABLE";
         active_route_id_.clear();
 
+        const std::string finished_mission_id = mission_id_;
+
         json msg;
         msg["TYPE"] = "MISSION_FINISHED";
-        msg["MISSION_ID"] = mission_id_;
+        msg["MISSION_ID"] = finished_mission_id;
+        msg["MISSION_TYPE"] = mission_type_;
         msg["DRONE_URI"] = drone_uri_;
+        msg["BATTERY"] = battery_;
+        msg["STATUS"] = "AVAILABLE";
+        msg["LAT"] = lat_;
+        msg["LON"] = lon_;
+        msg["ALTITUDE"] = altitude_;
+        msg["SPEED"] = speed_;
+        msg["DIRECTION"] = direction_;
+        msg["ROUTE_ID"] = "";
+        msg["FLIGHT_MODE"] = "STANDBY";
+        msg["SENSOR_STATUS"] = sensor_status_;
 
         send_json(msg);
 
+        mission_id_.clear();
+        mission_type_.clear();
+
         std::cout << "[DRONE] Mission finished: "
-                  << mission_id_ << std::endl;
+                  << finished_mission_id << std::endl;
     }
 
     void send_inspection_report(const InspectionPoint& point)
@@ -776,6 +830,8 @@ private:
                 formation_id_.clear();
                 formation_offset_north_m_ = 0.0;
                 formation_offset_east_m_ = 0.0;
+                mission_id_.clear();
+                mission_type_.clear();
 
                 // Demo: dron se odmah vrati na bazne koordinate.
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
@@ -795,6 +851,7 @@ private:
                 ack["ALTITUDE"] = altitude_;
                 ack["STATUS"] = status_;
                 ack["ROUTE_ID"] = active_route_id_;
+                add_telemetry_context(ack);
                 ack["REASON"] = msg.value("REASON", "UNKNOWN_REASON");
                 send_json(ack);
             }
@@ -838,7 +895,11 @@ private:
                 ack["LAT"] = lat_;
                 ack["LON"] = lon_;
                 ack["ALTITUDE"] = altitude_;
+                add_telemetry_context(ack);
                 send_json(ack);
+
+                mission_id_.clear();
+                mission_type_.clear();
             }
         }
         catch (std::exception& e)
@@ -882,6 +943,7 @@ private:
         ack["LAT"] = lat_;
         ack["LON"] = lon_;
         ack["ROUTE_ID"] = active_route_id_;
+        add_telemetry_context(ack);
 
         send_json(ack);
 
@@ -998,6 +1060,7 @@ private:
     int speed_;
     std::string direction_;
     std::string status_;
+    std::string sensor_status_;
 
     std::vector<GeoPoint> route_points_;
     std::size_t current_waypoint_;

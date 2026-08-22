@@ -7,6 +7,18 @@ if [[ -x /usr/local/openssl/bin/openssl ]]; then
 else
   OPENSSL_CHECK=openssl
 fi
+
+OPENSSL_LIB_DIR=""
+if [[ -d /usr/local/openssl/lib64 ]]; then
+  OPENSSL_LIB_DIR=/usr/local/openssl/lib64
+elif [[ -d /usr/local/openssl/lib ]]; then
+  OPENSSL_LIB_DIR=/usr/local/openssl/lib
+fi
+
+if [[ -n "$OPENSSL_LIB_DIR" ]]; then
+  export LD_LIBRARY_PATH="$OPENSSL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+fi
+
 COMMON=(-std=c++11 -I . -pthread)
 SSL_FLAGS=(-lssl -lcrypto)
 

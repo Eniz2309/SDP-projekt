@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 13
+// AUTONOMNI DRONOVI - VERZIJA 14
 // Fajl: regional_server.cpp
-// Dodano: REGISTER/AUTH zahtjevi se provjeravaju preko centralnog
-//         servera; TLS sesija dobija autentifikovani DRONE_URI.
+// Dodano: prijem, lokalno cuvanje i prosljedjivanje prosirene
+//         telemetrije: misija, rezim leta, senzori, brzina i smjer.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -488,7 +488,13 @@ void init_database()
             lat REAL,
             lon REAL,
             altitude INTEGER,
+            speed INTEGER DEFAULT 0,
+            direction TEXT DEFAULT '',
             route_id TEXT,
+            mission_id TEXT DEFAULT '',
+            mission_type TEXT DEFAULT '',
+            flight_mode TEXT DEFAULT 'UNKNOWN',
+            sensor_status TEXT DEFAULT 'UNKNOWN',
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
@@ -502,10 +508,41 @@ void init_database()
             lat REAL,
             lon REAL,
             altitude INTEGER,
+            speed INTEGER DEFAULT 0,
+            direction TEXT DEFAULT '',
             route_id TEXT,
+            mission_id TEXT DEFAULT '',
+            mission_type TEXT DEFAULT '',
+            flight_mode TEXT DEFAULT 'UNKNOWN',
+            sensor_status TEXT DEFAULT 'UNKNOWN',
             received_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
+
+    // Migracija postojecih baza nastalih prije prosirene telemetrije.
+    auto add_column_if_missing = [](const std::string& sql)
+    {
+        try
+        {
+            exec_sql(sql);
+        }
+        catch (const std::exception& e)
+        {
+            std::string error = e.what();
+            if (error.find("duplicate column name") == std::string::npos)
+                throw;
+        }
+    };
+
+    for (const std::string& table : {std::string("drones"), std::string("keepalive_log")})
+    {
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN speed INTEGER DEFAULT 0;");
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN direction TEXT DEFAULT '';" );
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN mission_id TEXT DEFAULT '';" );
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN mission_type TEXT DEFAULT '';" );
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN flight_mode TEXT DEFAULT 'UNKNOWN';" );
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN sensor_status TEXT DEFAULT 'UNKNOWN';" );
+    }
 
     exec_sql(R"(
         CREATE TABLE IF NOT EXISTS alarms (
@@ -545,7 +582,13 @@ void save_drone_status(const json& msg)
     double lat = msg.value("LAT", 0.0);
     double lon = msg.value("LON", 0.0);
     int altitude = msg.value("ALTITUDE", 0);
+    int speed = msg.value("SPEED", 0);
+    std::string direction = msg.value("DIRECTION", "");
     std::string route_id = msg.value("ROUTE_ID", "");
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string mission_type = msg.value("MISSION_TYPE", "");
+    std::string flight_mode = msg.value("FLIGHT_MODE", "UNKNOWN");
+    std::string sensor_status = msg.value("SENSOR_STATUS", "UNKNOWN");
 
     mark_drone_seen(msg);
 
@@ -553,21 +596,29 @@ void save_drone_status(const json& msg)
 
     auto upsert_stmt = g_db->prepare(R"(
         INSERT OR REPLACE INTO drones
-        (drone_uri, region_id, battery, status, lat, lon, altitude, route_id, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+        (drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
+         route_id, mission_id, mission_type, flight_mode, sensor_status, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
     )");
 
-    upsert_stmt.execute(drone_uri, REGION_ID, battery, status, lat, lon, altitude, route_id);
+    upsert_stmt.execute(drone_uri, REGION_ID, battery, status, lat, lon, altitude, speed, direction,
+                        route_id, mission_id, mission_type, flight_mode, sensor_status);
 
     auto log_stmt = g_db->prepare(R"(
-        INSERT INTO keepalive_log(drone_uri, battery, status, lat, lon, altitude, route_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO keepalive_log
+        (drone_uri, battery, status, lat, lon, altitude, speed, direction, route_id,
+         mission_id, mission_type, flight_mode, sensor_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     )");
 
-    log_stmt.execute(drone_uri, battery, status, lat, lon, altitude, route_id);
+    log_stmt.execute(drone_uri, battery, status, lat, lon, altitude, speed, direction, route_id,
+                     mission_id, mission_type, flight_mode, sensor_status);
 
     std::cout << "[REGIONAL] Status drona: " << drone_uri
               << " | " << status
+              << " | mission=" << (mission_id.empty() ? "NONE" : mission_id)
+              << " | mode=" << flight_mode
+              << " | sensor=" << sensor_status
               << " | battery=" << battery << "%"
               << " | route=" << route_id << std::endl;
 }
@@ -589,6 +640,16 @@ void save_alarm(const json& msg)
 
     std::cout << "[REGIONAL] Alarm: " << drone_uri
               << " | " << alarm_type << std::endl;
+}
+
+void copy_telemetry_context(json& dst, const json& src)
+{
+    dst["SPEED"] = src.value("SPEED", 0);
+    dst["DIRECTION"] = src.value("DIRECTION", "");
+    dst["MISSION_ID"] = src.value("MISSION_ID", "");
+    dst["MISSION_TYPE"] = src.value("MISSION_TYPE", "");
+    dst["FLIGHT_MODE"] = src.value("FLIGHT_MODE", "UNKNOWN");
+    dst["SENSOR_STATUS"] = src.value("SENSOR_STATUS", "UNKNOWN");
 }
 
 json send_to_central(json msg);
@@ -753,6 +814,7 @@ json handle_drone_message(json msg)
             status_msg["LON"] = msg.value("LON", 0.0);
             status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
             status_msg["ROUTE_ID"] = "";
+            copy_telemetry_context(status_msg, msg);
 
             save_drone_status(status_msg);
             send_to_central(status_msg);
@@ -850,6 +912,7 @@ json handle_drone_message(json msg)
         status_msg["LON"] = msg.value("LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
         status_msg["ROUTE_ID"] = "";
+        copy_telemetry_context(status_msg, msg);
         save_drone_status(status_msg);
 
         msg["TYPE"] = "DRONE_READY";
@@ -977,6 +1040,15 @@ json handle_drone_message(json msg)
     }
     else if (type == "MISSION_FINISHED")
     {
+        json status_msg = msg;
+        status_msg["TYPE"] = "DRONE_STATUS";
+        status_msg["STATUS"] = "AVAILABLE";
+        status_msg["ROUTE_ID"] = "";
+        status_msg["MISSION_ID"] = "";
+        status_msg["MISSION_TYPE"] = "";
+        status_msg["FLIGHT_MODE"] = "STANDBY";
+        save_drone_status(status_msg);
+
         response = send_to_central(msg);
         dispatch_assignments(response);
     }
@@ -997,6 +1069,10 @@ json handle_drone_message(json msg)
         status_msg["LON"] = msg.value("LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
         status_msg["ROUTE_ID"] = "";
+        copy_telemetry_context(status_msg, msg);
+        status_msg["MISSION_ID"] = "";
+        status_msg["MISSION_TYPE"] = "";
+        status_msg["FLIGHT_MODE"] = "STANDBY";
         save_drone_status(status_msg);
 
         response = send_to_central(msg);
@@ -1015,6 +1091,7 @@ json handle_drone_message(json msg)
         status_msg["LON"] = msg.value("LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
         status_msg["ROUTE_ID"] = msg.value("ROUTE_ID", "");
+        copy_telemetry_context(status_msg, msg);
 
         save_drone_status(status_msg);
         json central_response = send_to_central(status_msg);
@@ -1044,6 +1121,10 @@ json handle_drone_message(json msg)
         status_msg["LON"] = msg.value("BASE_LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
         status_msg["ROUTE_ID"] = "";
+        copy_telemetry_context(status_msg, msg);
+        status_msg["MISSION_ID"] = "";
+        status_msg["MISSION_TYPE"] = "";
+        status_msg["FLIGHT_MODE"] = "RTB";
 
         save_drone_status(status_msg);
         json central_response = send_to_central(status_msg);

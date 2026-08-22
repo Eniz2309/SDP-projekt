@@ -1,7 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 13
+// AUTONOMNI DRONOVI - VERZIJA 14
 // Fajl: udp_aead.h
-// Sigurnost: AES-256-GCM zastita UDP TELEMETRY/KEEPALIVE payload-a.
+// Dodano: bez funkcionalnih promjena; zadrzana AES-256-GCM
+//         zastita UDP TELEMETRY/KEEPALIVE payload-a.
 // ============================================================
 
 #ifndef SDP_UDP_AEAD_H

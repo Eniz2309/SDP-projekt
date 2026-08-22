@@ -9,6 +9,14 @@ else
   OPENSSL_BIN=openssl
 fi
 
+if [[ "$OPENSSL_BIN" == /usr/local/openssl/bin/openssl ]]; then
+  if [[ -d /usr/local/openssl/lib64 ]]; then
+    export LD_LIBRARY_PATH="/usr/local/openssl/lib64:${LD_LIBRARY_PATH:-}"
+  elif [[ -d /usr/local/openssl/lib ]]; then
+    export LD_LIBRARY_PATH="/usr/local/openssl/lib:${LD_LIBRARY_PATH:-}"
+  fi
+fi
+
 echo "[PQC] OpenSSL: $($OPENSSL_BIN version)"
 
 if ! $OPENSSL_BIN version | grep -Eq 'OpenSSL 3\.(5|[6-9])|OpenSSL [4-9]\.'; then

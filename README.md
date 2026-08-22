@@ -2,9 +2,6 @@
 
 Studentski projekat protokola za hijerarhijsko upravljanje autonomnim dronovima preko centralnog i regionalnog servera.
 
-export LD_LIBRARY_PATH=/usr/local/openssl/lib64:${LD_LIBRARY_PATH:-}
-export PATH=/usr/local/openssl/bin:$PATH
-
 ## Arhitektura
 
 ```text
@@ -31,7 +28,7 @@ Dronovi komuniciraju iskljucivo sa pripadajucim regionalnim serverom. Direktna k
 - FORMATION sa regionalnim serverom kao virtualnim leaderom
 - STOP_MISSION, promjena parametara leta i rucni RTB
 - LOW_BATTERY i CONNECTION_LOST alarmi
-- UDP TELEMETRY i KEEPALIVE
+- UDP TELEMETRY i KEEPALIVE sa zadatkom, rezimom leta i statusom senzora
 - SQLite evidencija dronova, misija, alarma, zona i inspection izvjestaja
 - TLS 1.3 sa `X25519MLKEM768` i `ML-DSA-44`
 - AES-256-GCM zastita UDP payload-a kljucem izvedenim iz TLS sesije
@@ -153,6 +150,29 @@ Nepoznat URI:
 
 Ocekivano: `UNKNOWN_DRONE_URI`.
 
+## Telemetrija
+
+Dron periodicki salje `TELEMETRY` i `KEEPALIVE` regionalnom serveru preko AES-256-GCM zasticenog UDP kanala. Trenutni operativni podaci ukljucuju:
+
+```text
+DRONE_URI
+BATTERY
+STATUS
+LAT / LON
+ALTITUDE
+SPEED
+DIRECTION
+ROUTE_ID
+MISSION_ID
+MISSION_TYPE
+FLIGHT_MODE
+SENSOR_STATUS
+```
+
+`MISSION_ID` i `MISSION_TYPE` opisuju trenutni zadatak. `FLIGHT_MODE` odvaja rezim leta (`GROUND`, `STANDBY`, `AUTONOMOUS`, `FORMATION`, `RTB`) od tipa zadatka, dok je `SENSOR_STATUS` simulirani health status senzorskog podsistema. Regionalni server cuva trenutno stanje i historijski log, a zatim isti status prosljedjuje centralnom serveru.
+
+Postojece SQLite baze se automatski dopunjavaju novim kolonama pri pokretanju servera.
+
 ## Provjera baze
 
 ```bash
@@ -164,6 +184,10 @@ Primjer:
 ```sql
 SELECT drone_uri, enabled, registered_region, created_at, last_auth_at
 FROM drone_credentials;
+
+SELECT drone_uri, status, mission_id, mission_type, flight_mode, sensor_status,
+       speed, direction, route_id, battery, lat, lon, altitude
+FROM drones;
 ```
 
 ## Mrezna sigurnost

@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 13
+// AUTONOMNI DRONOVI - VERZIJA 14
 // Fajl: central_server.cpp
-// Dodano: centralni credential registar, SHA-256 provjera tokena,
-//         vezivanje drona za region i centralna REGISTER/AUTH provjera.
+// Dodano: prosireni globalni registar telemetrije sa MISSION_ID,
+//         MISSION_TYPE, FLIGHT_MODE, SENSOR_STATUS, SPEED i DIRECTION.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -230,10 +230,39 @@ void init_database()
             lat REAL,
             lon REAL,
             altitude INTEGER,
+            speed INTEGER DEFAULT 0,
+            direction TEXT DEFAULT '',
             route_id TEXT,
+            mission_id TEXT DEFAULT '',
+            mission_type TEXT DEFAULT '',
+            flight_mode TEXT DEFAULT 'UNKNOWN',
+            sensor_status TEXT DEFAULT 'UNKNOWN',
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
+
+    // Migracija postojece baze: CREATE TABLE IF NOT EXISTS ne dodaje nove kolone.
+    // ALTER greska za vec postojecu kolonu se ignorise, ostale greske se prijavljuju.
+    auto add_column_if_missing = [](const std::string& sql)
+    {
+        try
+        {
+            exec_sql(sql);
+        }
+        catch (const std::exception& e)
+        {
+            std::string error = e.what();
+            if (error.find("duplicate column name") == std::string::npos)
+                throw;
+        }
+    };
+
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN speed INTEGER DEFAULT 0;");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN direction TEXT DEFAULT '';");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN mission_id TEXT DEFAULT '';");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN mission_type TEXT DEFAULT '';");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN flight_mode TEXT DEFAULT 'UNKNOWN';");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN sensor_status TEXT DEFAULT 'UNKNOWN';");
 
     exec_sql(R"(
         CREATE TABLE IF NOT EXISTS drone_credentials (
@@ -828,20 +857,31 @@ void handle_drone_status(const json& msg)
     double lat = msg.value("LAT", 0.0);
     double lon = msg.value("LON", 0.0);
     int altitude = msg.value("ALTITUDE", 0);
+    int speed = msg.value("SPEED", 0);
+    std::string direction = msg.value("DIRECTION", "");
     std::string route_id = msg.value("ROUTE_ID", "");
+    std::string mission_id = msg.value("MISSION_ID", "");
+    std::string mission_type = msg.value("MISSION_TYPE", "");
+    std::string flight_mode = msg.value("FLIGHT_MODE", "UNKNOWN");
+    std::string sensor_status = msg.value("SENSOR_STATUS", "UNKNOWN");
 
     std::lock_guard<std::mutex> lock(db_mutex);
 
     auto stmt = g_db->prepare(R"(
         INSERT OR REPLACE INTO drones
-        (drone_uri, region_id, battery, status, lat, lon, altitude, route_id, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+        (drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
+         route_id, mission_id, mission_type, flight_mode, sensor_status, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
     )");
 
-    stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, route_id);
+    stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
+                 route_id, mission_id, mission_type, flight_mode, sensor_status);
 
     std::cout << "[CENTRAL] Status drona: " << drone_uri
               << " | " << status
+              << " | mission=" << (mission_id.empty() ? "NONE" : mission_id)
+              << " | mode=" << flight_mode
+              << " | sensor=" << sensor_status
               << " | battery=" << battery << "%" << std::endl;
 }
 
@@ -874,7 +914,7 @@ json handle_alarm(const json& msg)
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'CONNECTION_LOST'
+            SET status = 'CONNECTION_LOST', flight_mode = 'CONNECTION_LOST'
             WHERE drone_uri = ?;
         )");
         drone_stmt.execute(drone_uri);
@@ -1002,7 +1042,8 @@ json handle_ack_stop(const json& msg)
 
             auto drone_stmt = g_db->prepare(R"(
                 UPDATE drones
-                SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+                SET status = 'AVAILABLE', route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'STANDBY', last_seen = CURRENT_TIMESTAMP
                 WHERE drone_uri = ?;
             )");
             drone_stmt.execute(drone_uri);
@@ -1056,6 +1097,9 @@ json handle_ack_stop(const json& msg)
             UPDATE drones
             SET status = 'AVAILABLE',
                 route_id = '',
+                mission_id = '',
+                mission_type = '',
+                flight_mode = 'STANDBY',
                 last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
@@ -1228,7 +1272,8 @@ json handle_mission_finished(const json& msg)
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            SET status = 'AVAILABLE', route_id = '', mission_id = '', mission_type = '',
+                flight_mode = 'STANDBY', last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
         drone_stmt.execute(drone_uri);
@@ -1436,10 +1481,11 @@ bool build_assignment(const std::string& mission_id,
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'BUSY', route_id = ?, altitude = ?, last_seen = CURRENT_TIMESTAMP
+            SET status = 'BUSY', route_id = ?, altitude = ?, mission_id = ?, mission_type = ?,
+                flight_mode = 'AUTONOMOUS', last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ? AND status = 'AVAILABLE';
         )");
-        drone_stmt.execute(route_id, assigned_altitude, drone_uri);
+        drone_stmt.execute(route_id, assigned_altitude, mission_id, mission_type, drone_uri);
     }
 
     assignment["TYPE"] = "START_MISSION";
@@ -1567,7 +1613,9 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'BUSY', route_id = ?, altitude = ?, last_seen = CURRENT_TIMESTAMP
+            SET status = 'BUSY', route_id = ?, altitude = ?, mission_id = ?,
+                mission_type = 'FORMATION', flight_mode = 'FORMATION',
+                last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ? AND status = 'AVAILABLE';
         )");
 
@@ -1580,7 +1628,7 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
 
             member_stmt.execute(mission_id, members[i], i,
                                 offset_north_m, offset_east_m);
-            drone_stmt.execute(route_id, formation_altitude, members[i]);
+            drone_stmt.execute(route_id, formation_altitude, mission_id, members[i]);
         }
     }
 
@@ -1688,7 +1736,8 @@ json handle_drone_ready(const json& msg)
         std::lock_guard<std::mutex> lock(db_mutex);
         auto stmt = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'AVAILABLE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            SET status = 'AVAILABLE', route_id = '', mission_id = '', mission_type = '',
+                flight_mode = 'STANDBY', last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
         stmt.execute(drone_uri);
@@ -1908,7 +1957,8 @@ json handle_manual_rtb_request(const json& msg)
 
         auto d = g_db->prepare(R"(
             UPDATE drones
-            SET status = 'RETURN_TO_BASE', route_id = '', last_seen = CURRENT_TIMESTAMP
+            SET status = 'RETURN_TO_BASE', route_id = '', mission_id = '', mission_type = '',
+                flight_mode = 'RTB', last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
         d.execute(drone_uri);
