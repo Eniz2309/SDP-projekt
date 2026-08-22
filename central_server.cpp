@@ -1,8 +1,9 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 14
+// AUTONOMNI DRONOVI - VERZIJA 15
 // Fajl: central_server.cpp
-// Dodano: prosireni globalni registar telemetrije sa MISSION_ID,
-//         MISSION_TYPE, FLIGHT_MODE, SENSOR_STATUS, SPEED i DIRECTION.
+// Dodano: geometrijska detekcija konflikta planiranih ruta,
+//         horizontalna sigurnosna zona, automatski izbor sigurnog
+//         visinskog slota, QUEUED fallback i zastita CHANGE_PARAMS.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 #include <openssl/evp.h>
 
 #include <sqlite3.h>
@@ -36,6 +38,12 @@ std::mutex scheduler_mutex;
 
 const int DEFAULT_MAX_DRONES_PER_ROUTE = 3;
 const int DEFAULT_VERTICAL_SEPARATION_M = 2;
+
+// Horizontalni razmak izmedju planiranih putanja na istoj/
+// nedovoljno razdvojenoj visini. Vrijednost je simulacijski parametar.
+const double DEFAULT_HORIZONTAL_ROUTE_SAFETY_M = 20.0;
+const int MIN_FLIGHT_ALTITUDE_M = 20;
+const int MAX_FLIGHT_ALTITUDE_M = 500;
 
 struct LocalPoint
 {
@@ -290,11 +298,20 @@ void init_database()
             delivery_lon REAL,
             exit_lat REAL,
             exit_lon REAL,
+            start_lat REAL DEFAULT 0,
+            start_lon REAL DEFAULT 0,
+            queue_reason TEXT DEFAULT '',
             status TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
         );
     )");
+
+    // Migracija starijih baza: DELIVERY putanja pamti pocetnu poziciju,
+    // a QUEUED misija moze objasniti zasto scheduler nije dodijelio let.
+    add_column_if_missing("ALTER TABLE missions ADD COLUMN start_lat REAL DEFAULT 0;");
+    add_column_if_missing("ALTER TABLE missions ADD COLUMN start_lon REAL DEFAULT 0;");
+    add_column_if_missing("ALTER TABLE missions ADD COLUMN queue_reason TEXT DEFAULT '';");
 
     exec_sql(R"(
         CREATE TABLE IF NOT EXISTS inspection_reports (
@@ -541,49 +558,466 @@ RouteInfo get_route_info(const std::string& region_id,
     return result;
 }
 
-bool assign_altitude_slot(const std::string& region_id,
+struct RoutePathGeometry
+{
+    bool valid;
+    std::vector<GeoPoint> points;
+    double extra_horizontal_buffer_m;
+
+    RoutePathGeometry() : valid(false), extra_horizontal_buffer_m(0.0) {}
+};
+
+struct RouteConflictInfo
+{
+    bool conflict;
+    std::string active_mission_id;
+    std::string active_route_id;
+    int active_altitude;
+    double minimum_horizontal_distance_m;
+    double required_horizontal_distance_m;
+    int required_vertical_separation_m;
+
+    RouteConflictInfo()
+        : conflict(false), active_altitude(0),
+          minimum_horizontal_distance_m(std::numeric_limits<double>::infinity()),
+          required_horizontal_distance_m(DEFAULT_HORIZONTAL_ROUTE_SAFETY_M),
+          required_vertical_separation_m(DEFAULT_VERTICAL_SEPARATION_M) {}
+};
+
+std::vector<GeoPoint> make_square_route_points(const ZoneInfo& zone_info,
+                                                const RouteInfo& route,
+                                                bool close_loop)
+{
+    std::vector<GeoPoint> points;
+    const double h = static_cast<double>(route.half_size_m);
+    const double north[5] = { h, h, -h, -h, h };
+    const double east[5]  = { -h, h, h, -h, -h };
+    const int count = close_loop ? 5 : 4;
+
+    for (int i = 0; i < count; ++i)
+    {
+        points.push_back(offset_to_latlon(zone_info.center_lat, zone_info.center_lon,
+                                          north[i], east[i]));
+    }
+    return points;
+}
+
+double point_to_segment_distance(const LocalPoint& p,
+                                 const LocalPoint& a,
+                                 const LocalPoint& b)
+{
+    const double vx = b.east_m - a.east_m;
+    const double vy = b.north_m - a.north_m;
+    const double wx = p.east_m - a.east_m;
+    const double wy = p.north_m - a.north_m;
+    const double len2 = vx * vx + vy * vy;
+
+    if (len2 <= 1e-12)
+    {
+        const double dx = p.east_m - a.east_m;
+        const double dy = p.north_m - a.north_m;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    double t = (wx * vx + wy * vy) / len2;
+    t = std::max(0.0, std::min(1.0, t));
+
+    const double proj_east = a.east_m + t * vx;
+    const double proj_north = a.north_m + t * vy;
+    const double dx = p.east_m - proj_east;
+    const double dy = p.north_m - proj_north;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+double cross_2d(const LocalPoint& a, const LocalPoint& b, const LocalPoint& c)
+{
+    return (b.east_m - a.east_m) * (c.north_m - a.north_m) -
+           (b.north_m - a.north_m) * (c.east_m - a.east_m);
+}
+
+bool point_on_segment(const LocalPoint& p, const LocalPoint& a, const LocalPoint& b)
+{
+    const double EPS = 1e-9;
+    if (std::abs(cross_2d(a, b, p)) > EPS)
+        return false;
+
+    return p.east_m >= std::min(a.east_m, b.east_m) - EPS &&
+           p.east_m <= std::max(a.east_m, b.east_m) + EPS &&
+           p.north_m >= std::min(a.north_m, b.north_m) - EPS &&
+           p.north_m <= std::max(a.north_m, b.north_m) + EPS;
+}
+
+bool segments_intersect(const LocalPoint& a, const LocalPoint& b,
+                        const LocalPoint& c, const LocalPoint& d)
+{
+    const double c1 = cross_2d(a, b, c);
+    const double c2 = cross_2d(a, b, d);
+    const double c3 = cross_2d(c, d, a);
+    const double c4 = cross_2d(c, d, b);
+    const double EPS = 1e-9;
+
+    if (((c1 > EPS && c2 < -EPS) || (c1 < -EPS && c2 > EPS)) &&
+        ((c3 > EPS && c4 < -EPS) || (c3 < -EPS && c4 > EPS)))
+        return true;
+
+    if (std::abs(c1) <= EPS && point_on_segment(c, a, b)) return true;
+    if (std::abs(c2) <= EPS && point_on_segment(d, a, b)) return true;
+    if (std::abs(c3) <= EPS && point_on_segment(a, c, d)) return true;
+    if (std::abs(c4) <= EPS && point_on_segment(b, c, d)) return true;
+
+    return false;
+}
+
+double segment_distance(const LocalPoint& a, const LocalPoint& b,
+                        const LocalPoint& c, const LocalPoint& d)
+{
+    if (segments_intersect(a, b, c, d))
+        return 0.0;
+
+    return std::min(
+        std::min(point_to_segment_distance(a, c, d),
+                 point_to_segment_distance(b, c, d)),
+        std::min(point_to_segment_distance(c, a, b),
+                 point_to_segment_distance(d, a, b)));
+}
+
+double minimum_path_distance_m(const RoutePathGeometry& first,
+                               const RoutePathGeometry& second,
+                               double reference_lat,
+                               double reference_lon)
+{
+    if (!first.valid || !second.valid ||
+        first.points.size() < 2 || second.points.size() < 2)
+        return std::numeric_limits<double>::infinity();
+
+    double minimum = std::numeric_limits<double>::infinity();
+
+    for (std::size_t i = 1; i < first.points.size(); ++i)
+    {
+        LocalPoint a = latlon_to_offset(reference_lat, reference_lon,
+                                        first.points[i - 1].lat, first.points[i - 1].lon);
+        LocalPoint b = latlon_to_offset(reference_lat, reference_lon,
+                                        first.points[i].lat, first.points[i].lon);
+
+        for (std::size_t j = 1; j < second.points.size(); ++j)
+        {
+            LocalPoint c = latlon_to_offset(reference_lat, reference_lon,
+                                            second.points[j - 1].lat, second.points[j - 1].lon);
+            LocalPoint d = latlon_to_offset(reference_lat, reference_lon,
+                                            second.points[j].lat, second.points[j].lon);
+
+            minimum = std::min(minimum, segment_distance(a, b, c, d));
+            if (minimum <= 1e-6)
+                return 0.0;
+        }
+    }
+
+    return minimum;
+}
+
+double formation_horizontal_buffer_m(const std::string& mission_id)
+{
+    int formation_size = 0;
+    double spacing_m = 0.0;
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto q = g_db->prepare(
+        "SELECT formation_size FROM formation_requests WHERE mission_id = ?;");
+    q.execute(mission_id);
+    if (!q.fetch(formation_size))
+        return 0.0;
+
+    q = g_db->prepare(
+        "SELECT spacing_m FROM formation_requests WHERE mission_id = ?;");
+    q.execute(mission_id);
+    q.fetch(spacing_m);
+
+    if (formation_size <= 1)
+        return 0.0;
+
+    return ((formation_size - 1) / 2.0) * spacing_m;
+}
+
+RoutePathGeometry build_route_path_geometry(const std::string& mission_id,
+                                            const std::string& region_id,
+                                            const std::string& mission_type,
+                                            const std::string& zone,
+                                            const std::string& route_id,
+                                            double start_lat,
+                                            double start_lon,
+                                            double delivery_lat,
+                                            double delivery_lon,
+                                            double exit_lat,
+                                            double exit_lon)
+{
+    RoutePathGeometry result;
+    ZoneInfo zone_info = get_zone_info(region_id, zone);
+    RouteInfo route = get_route_info(region_id, zone, route_id);
+
+    if (!zone_info.found || !route.found)
+        return result;
+
+    if (mission_type == "DELIVERY")
+    {
+        if (delivery_lat == 0.0 && delivery_lon == 0.0)
+            return result;
+
+        if (start_lat == 0.0 && start_lon == 0.0)
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto q = g_db->prepare(
+                "SELECT base_lat FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id); q.fetch(start_lat);
+            q = g_db->prepare(
+                "SELECT base_lon FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id); q.fetch(start_lon);
+        }
+
+        if (exit_lat == 0.0 && exit_lon == 0.0)
+        {
+            LocalPoint delivery_offset = latlon_to_offset(
+                zone_info.center_lat, zone_info.center_lon,
+                delivery_lat, delivery_lon);
+            LocalPoint exit_local = closest_point_on_square_contour(
+                delivery_offset.north_m, delivery_offset.east_m,
+                static_cast<double>(route.half_size_m));
+            GeoPoint exit_geo = offset_to_latlon(
+                zone_info.center_lat, zone_info.center_lon,
+                exit_local.north_m, exit_local.east_m);
+            exit_lat = exit_geo.lat;
+            exit_lon = exit_geo.lon;
+        }
+
+        result.points.push_back(GeoPoint{start_lat, start_lon});
+        result.points.push_back(GeoPoint{exit_lat, exit_lon});
+        result.points.push_back(GeoPoint{delivery_lat, delivery_lon});
+        result.valid = true;
+        return result;
+    }
+
+    const bool close_loop = (mission_type != "INSPECTION");
+    result.points = make_square_route_points(zone_info, route, close_loop);
+
+    if (mission_type == "FORMATION")
+        result.extra_horizontal_buffer_m = formation_horizontal_buffer_m(mission_id);
+
+    result.valid = result.points.size() >= 2;
+    return result;
+}
+
+RouteConflictInfo find_route_conflict(const std::string& candidate_mission_id,
+                                      const std::string& region_id,
+                                      const std::string& mission_type,
+                                      const std::string& zone,
+                                      const std::string& route_id,
+                                      const RouteInfo& candidate_route,
+                                      int candidate_altitude,
+                                      double start_lat,
+                                      double start_lon,
+                                      double delivery_lat,
+                                      double delivery_lon,
+                                      double exit_lat,
+                                      double exit_lon)
+{
+    RouteConflictInfo result;
+
+    RoutePathGeometry candidate = build_route_path_geometry(
+        candidate_mission_id, region_id, mission_type, zone, route_id,
+        start_lat, start_lon, delivery_lat, delivery_lon, exit_lat, exit_lon);
+
+    if (!candidate.valid)
+        return result;
+
+    std::vector<std::string> active_ids;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare(R"(
+            SELECT mission_id
+            FROM missions
+            WHERE region_id = ?
+              AND mission_id <> ?
+              AND status IN ('ACTIVE', 'STOP_REQUESTED');
+        )");
+        q.execute(region_id, candidate_mission_id);
+        std::string id;
+        while (q.fetch(id))
+            active_ids.push_back(id);
+    }
+
+    for (const auto& active_id : active_ids)
+    {
+        std::string active_type, active_zone, active_route_id;
+        int active_altitude = 0;
+        double active_delivery_lat = 0.0, active_delivery_lon = 0.0;
+        double active_exit_lat = 0.0, active_exit_lon = 0.0;
+        double active_start_lat = 0.0, active_start_lon = 0.0;
+
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); if (!q.fetch(active_type)) continue;
+            q = g_db->prepare("SELECT zone FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_zone);
+            q = g_db->prepare("SELECT route_id FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_route_id);
+            q = g_db->prepare("SELECT altitude FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_altitude);
+            q = g_db->prepare("SELECT delivery_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_delivery_lat);
+            q = g_db->prepare("SELECT delivery_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_delivery_lon);
+            q = g_db->prepare("SELECT exit_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_exit_lat);
+            q = g_db->prepare("SELECT exit_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_exit_lon);
+            q = g_db->prepare("SELECT start_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_start_lat);
+            q = g_db->prepare("SELECT start_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_id); q.fetch(active_start_lon);
+        }
+
+        RouteInfo active_route = get_route_info(region_id, active_zone, active_route_id);
+        if (!active_route.found)
+            continue;
+
+        const int required_vertical = std::max(candidate_route.vertical_separation,
+                                               active_route.vertical_separation);
+        const int vertical_distance = std::abs(candidate_altitude - active_altitude);
+        if (vertical_distance >= required_vertical)
+            continue;
+
+        RoutePathGeometry active = build_route_path_geometry(
+            active_id, region_id, active_type, active_zone, active_route_id,
+            active_start_lat, active_start_lon,
+            active_delivery_lat, active_delivery_lon,
+            active_exit_lat, active_exit_lon);
+
+        if (!active.valid)
+            continue;
+
+        ZoneInfo reference_zone = get_zone_info(region_id, zone);
+        if (!reference_zone.found)
+            continue;
+
+        const double minimum_distance = minimum_path_distance_m(
+            candidate, active, reference_zone.center_lat, reference_zone.center_lon);
+        const double required_horizontal = DEFAULT_HORIZONTAL_ROUTE_SAFETY_M +
+                                           candidate.extra_horizontal_buffer_m +
+                                           active.extra_horizontal_buffer_m;
+
+        if (minimum_distance <= required_horizontal)
+        {
+            result.conflict = true;
+            result.active_mission_id = active_id;
+            result.active_route_id = active_route_id;
+            result.active_altitude = active_altitude;
+            result.minimum_horizontal_distance_m = minimum_distance;
+            result.required_horizontal_distance_m = required_horizontal;
+            result.required_vertical_separation_m = required_vertical;
+            return result;
+        }
+    }
+
+    return result;
+}
+
+bool assign_altitude_slot(const std::string& mission_id,
+                          const std::string& region_id,
+                          const std::string& mission_type,
                           const std::string& zone,
                           const std::string& route_id,
                           const RouteInfo& route,
                           int base_altitude,
+                          double start_lat,
+                          double start_lon,
+                          double delivery_lat,
+                          double delivery_lon,
+                          double exit_lat,
+                          double exit_lon,
                           int& assigned_altitude,
-                          int& assigned_slot)
+                          int& assigned_slot,
+                          std::string& failure_reason)
 {
     std::vector<bool> used_slots(route.max_drones, false);
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
-
         auto stmt = g_db->prepare(R"(
             SELECT altitude_slot
             FROM missions
-            WHERE status = 'ACTIVE'
+            WHERE status IN ('ACTIVE', 'STOP_REQUESTED')
               AND region_id = ?
               AND zone = ?
               AND route_id = ?;
         )");
-
         stmt.execute(region_id, zone, route_id);
 
         int slot = 0;
         while (stmt.fetch(slot))
         {
             if (slot >= 0 && slot < route.max_drones)
-            {
                 used_slots[slot] = true;
-            }
         }
     }
 
-    for (int i = 0; i < route.max_drones; i++)
+    bool had_free_slot = false;
+    bool saw_geometric_conflict = false;
+
+    for (int i = 0; i < route.max_drones; ++i)
     {
-        if (!used_slots[i])
+        if (used_slots[i])
+            continue;
+
+        had_free_slot = true;
+        const int candidate_altitude = base_altitude + i * route.vertical_separation;
+        if (candidate_altitude < MIN_FLIGHT_ALTITUDE_M ||
+            candidate_altitude > MAX_FLIGHT_ALTITUDE_M)
+            continue;
+
+        RouteConflictInfo conflict = find_route_conflict(
+            mission_id, region_id, mission_type, zone, route_id, route,
+            candidate_altitude, start_lat, start_lon,
+            delivery_lat, delivery_lon, exit_lat, exit_lon);
+
+        if (conflict.conflict)
         {
-            assigned_slot = i;
-            assigned_altitude = base_altitude + i * route.vertical_separation;
-            return true;
+            saw_geometric_conflict = true;
+            std::ostringstream log;
+            log << std::fixed << std::setprecision(1)
+                << "[CENTRAL][ROUTE] konflikt: candidate=" << mission_id
+                << " route=" << route_id
+                << " alt=" << candidate_altitude << "m"
+                << " <-> active=" << conflict.active_mission_id
+                << " route=" << conflict.active_route_id
+                << " alt=" << conflict.active_altitude << "m"
+                << " | horizontal=" << conflict.minimum_horizontal_distance_m
+                << "m (min=" << conflict.required_horizontal_distance_m << "m)"
+                << " | vertical_min=" << conflict.required_vertical_separation_m
+                << "m";
+            std::cout << log.str() << std::endl;
+            continue;
         }
+
+        assigned_slot = i;
+        assigned_altitude = candidate_altitude;
+        failure_reason.clear();
+
+        if (saw_geometric_conflict)
+        {
+            std::cout << "[CENTRAL][ROUTE] " << mission_id
+                      << " dobio alternativnu sigurnu visinu "
+                      << assigned_altitude << "m (slot=" << assigned_slot << ")."
+                      << std::endl;
+        }
+        return true;
     }
+
+    if (saw_geometric_conflict)
+        failure_reason = "ROUTE_CONFLICT_NO_SAFE_ALTITUDE";
+    else if (!had_free_slot)
+        failure_reason = "ROUTE_CAPACITY_FULL";
+    else
+        failure_reason = "NO_VALID_ALTITUDE_SLOT";
 
     return false;
 }
@@ -876,6 +1310,20 @@ void handle_drone_status(const json& msg)
 
     stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
                  route_id, mission_id, mission_type, flight_mode, sensor_status);
+
+    // Ako operator promijeni visinu tokom aktivne misije, ACK/telemetrija
+    // osvjezava i planerski zapis. Tako naredna provjera konflikta ne koristi
+    // zastarjelu visinu iz trenutka prvobitne dodjele.
+    if (!mission_id.empty())
+    {
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET altitude = ?
+            WHERE mission_id = ?
+              AND status IN ('ACTIVE', 'STOP_REQUESTED');
+        )");
+        mission_stmt.execute(altitude, mission_id);
+    }
 
     std::cout << "[CENTRAL] Status drona: " << drone_uri
               << " | " << status
@@ -1410,6 +1858,7 @@ bool build_assignment(const std::string& mission_id,
     int mission_priority = 0;
     int requested_altitude = 120;
     double delivery_lat = 0.0, delivery_lon = 0.0;
+    double start_lat = 0.0, start_lon = 0.0;
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
@@ -1430,6 +1879,10 @@ bool build_assignment(const std::string& mission_id,
         q.execute(mission_id); q.fetch(delivery_lat);
         q = g_db->prepare("SELECT delivery_lon FROM missions WHERE mission_id = ?;");
         q.execute(mission_id); q.fetch(delivery_lon);
+        q = g_db->prepare("SELECT lat FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri); q.fetch(start_lat);
+        q = g_db->prepare("SELECT lon FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri); q.fetch(start_lon);
     }
 
     ZoneInfo zone_info = get_zone_info(region_id, zone);
@@ -1461,10 +1914,16 @@ bool build_assignment(const std::string& mission_id,
 
     int assigned_altitude = 0;
     int assigned_slot = -1;
-    if (!assign_altitude_slot(region_id, zone, route_id, route,
-                              requested_altitude, assigned_altitude, assigned_slot))
+    std::string route_failure_reason;
+    if (!assign_altitude_slot(mission_id, region_id, mission_type, zone, route_id, route,
+                              requested_altitude, start_lat, start_lon,
+                              delivery_lat, delivery_lon, exit_geo.lat, exit_geo.lon,
+                              assigned_altitude, assigned_slot, route_failure_reason))
     {
-        // Vazno: ruta puna NE izaziva preemption. Zadatak ostaje QUEUED.
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare(
+            "UPDATE missions SET queue_reason = ? WHERE mission_id = ? AND status = 'QUEUED';");
+        q.execute(route_failure_reason, mission_id);
         return false;
     }
 
@@ -1473,11 +1932,12 @@ bool build_assignment(const std::string& mission_id,
         auto mission_stmt = g_db->prepare(R"(
             UPDATE missions
             SET drone_uri = ?, route_id = ?, altitude = ?, altitude_slot = ?,
-                exit_lat = ?, exit_lon = ?, status = 'ACTIVE'
+                exit_lat = ?, exit_lon = ?, start_lat = ?, start_lon = ?,
+                queue_reason = '', status = 'ACTIVE'
             WHERE mission_id = ? AND status = 'QUEUED';
         )");
         mission_stmt.execute(drone_uri, route_id, assigned_altitude, assigned_slot,
-                             exit_geo.lat, exit_geo.lon, mission_id);
+                             exit_geo.lat, exit_geo.lon, start_lat, start_lon, mission_id);
 
         auto drone_stmt = g_db->prepare(R"(
             UPDATE drones
@@ -1505,6 +1965,7 @@ bool build_assignment(const std::string& mission_id,
     assignment["ALTITUDE_SLOT"] = assigned_slot;
     assignment["MAX_DRONES_ON_ROUTE"] = route.max_drones;
     assignment["VERTICAL_SEPARATION_M"] = route.vertical_separation;
+    assignment["HORIZONTAL_ROUTE_SAFETY_M"] = DEFAULT_HORIZONTAL_ROUTE_SAFETY_M;
 
     if (mission_type == "DELIVERY")
     {
@@ -1585,9 +2046,18 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
     // Svi clanovi dobijaju potpuno isti altitude.
     int formation_altitude = 0;
     int formation_slot = -1;
-    if (!assign_altitude_slot(region_id, zone, route_id, route,
-                              requested_altitude, formation_altitude, formation_slot))
+    std::string route_failure_reason;
+    if (!assign_altitude_slot(mission_id, region_id, "FORMATION", zone, route_id, route,
+                              requested_altitude, 0.0, 0.0,
+                              0.0, 0.0, 0.0, 0.0,
+                              formation_altitude, formation_slot, route_failure_reason))
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare(
+            "UPDATE missions SET queue_reason = ? WHERE mission_id = ? AND status = 'QUEUED';");
+        q.execute(route_failure_reason, mission_id);
         return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
@@ -1595,7 +2065,7 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
         auto mission_stmt = g_db->prepare(R"(
             UPDATE missions
             SET drone_uri = ?, route_id = ?, altitude = ?, altitude_slot = ?,
-                status = 'ACTIVE'
+                queue_reason = '', status = 'ACTIVE'
             WHERE mission_id = ? AND status = 'QUEUED';
         )");
         // drone_uri je samo reprezentativni clan radi kompatibilnosti sa starijom semom.
@@ -1652,6 +2122,7 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
         command["HALF_SIZE_M"] = route.half_size_m;
         command["ALTITUDE"] = formation_altitude;
         command["ALTITUDE_SLOT"] = formation_slot;
+        command["HORIZONTAL_ROUTE_SAFETY_M"] = DEFAULT_HORIZONTAL_ROUTE_SAFETY_M;
         command["FORMATION_SIZE"] = formation_size;
         command["FORMATION_MEMBER_INDEX"] = i;
         command["OFFSET_NORTH_M"] = 0.0;
@@ -1819,6 +2290,105 @@ json handle_change_params_request(const json& msg)
         response["DRONE_URI"] = drone_uri;
         response["REASON"] = "DRONE_RETURNING_TO_BASE";
         return response;
+    }
+
+    // CHANGE_PARAMS ne smije zaobici route scheduler. Ako dron ima aktivnu
+    // misiju, trazena visina se provjerava istom geometrijskom logikom.
+    std::string active_mission_id;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare(R"(
+            SELECT mission_id
+            FROM missions
+            WHERE drone_uri = ?
+              AND status IN ('ACTIVE', 'STOP_REQUESTED')
+            LIMIT 1;
+        )");
+        q.execute(drone_uri);
+        q.fetch(active_mission_id);
+
+        if (active_mission_id.empty())
+        {
+            q = g_db->prepare(R"(
+                SELECT fm.mission_id
+                FROM formation_members fm
+                JOIN missions m ON m.mission_id = fm.mission_id
+                WHERE fm.drone_uri = ?
+                  AND fm.status = 'ACTIVE'
+                  AND m.status IN ('ACTIVE', 'STOP_REQUESTED')
+                LIMIT 1;
+            )");
+            q.execute(drone_uri);
+            q.fetch(active_mission_id);
+        }
+    }
+
+    if (!active_mission_id.empty())
+    {
+        std::string mission_type, zone, route_id;
+        double start_lat = 0.0, start_lon = 0.0;
+        double delivery_lat = 0.0, delivery_lon = 0.0;
+        double exit_lat = 0.0, exit_lon = 0.0;
+
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(mission_type);
+            q = g_db->prepare("SELECT zone FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(zone);
+            q = g_db->prepare("SELECT route_id FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(route_id);
+            q = g_db->prepare("SELECT start_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(start_lat);
+            q = g_db->prepare("SELECT start_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(start_lon);
+            q = g_db->prepare("SELECT delivery_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(delivery_lat);
+            q = g_db->prepare("SELECT delivery_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(delivery_lon);
+            q = g_db->prepare("SELECT exit_lat FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(exit_lat);
+            q = g_db->prepare("SELECT exit_lon FROM missions WHERE mission_id = ?;");
+            q.execute(active_mission_id); q.fetch(exit_lon);
+        }
+
+        if (mission_type == "FORMATION")
+        {
+            response["TYPE"] = "CONTROL_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "FORMATION_ALTITUDE_MANAGED_BY_SERVER";
+            response["MISSION_ID"] = active_mission_id;
+            return response;
+        }
+
+        RouteInfo route = get_route_info(drone_region, zone, route_id);
+        if (route.found)
+        {
+            RouteConflictInfo conflict = find_route_conflict(
+                active_mission_id, drone_region, mission_type, zone, route_id, route,
+                altitude, start_lat, start_lon, delivery_lat, delivery_lon,
+                exit_lat, exit_lon);
+
+            if (conflict.conflict)
+            {
+                response["TYPE"] = "CONTROL_REJECTED";
+                response["DRONE_URI"] = drone_uri;
+                response["REASON"] = "ROUTE_CONFLICT_AT_REQUESTED_ALTITUDE";
+                response["MISSION_ID"] = active_mission_id;
+                response["CONFLICT_WITH_MISSION"] = conflict.active_mission_id;
+                response["CONFLICT_WITH_ALTITUDE"] = conflict.active_altitude;
+                response["MIN_HORIZONTAL_DISTANCE_M"] = conflict.minimum_horizontal_distance_m;
+                response["REQUIRED_HORIZONTAL_DISTANCE_M"] = conflict.required_horizontal_distance_m;
+                response["REQUIRED_VERTICAL_SEPARATION_M"] = conflict.required_vertical_separation_m;
+
+                std::cout << "[CENTRAL][CONTROL] CHANGE_PARAMS odbijen za "
+                          << drone_uri << " | mission=" << active_mission_id
+                          << " | trazena visina=" << altitude
+                          << "m | konflikt sa " << conflict.active_mission_id
+                          << std::endl;
+                return response;
+            }
+        }
     }
 
     json command;
@@ -2064,12 +2634,15 @@ json handle_mission_submit(const json& msg)
     json assignments = schedule_region(region_id);
     std::string current_status = "QUEUED";
     std::string assigned_drone;
+    std::string queue_reason;
     {
         std::lock_guard<std::mutex> lock(db_mutex);
         auto s = g_db->prepare("SELECT status FROM missions WHERE mission_id = ?;");
         s.execute(mission_id); s.fetch(current_status);
         s = g_db->prepare("SELECT drone_uri FROM missions WHERE mission_id = ?;");
         s.execute(mission_id); s.fetch(assigned_drone);
+        s = g_db->prepare("SELECT queue_reason FROM missions WHERE mission_id = ?;");
+        s.execute(mission_id); s.fetch(queue_reason);
     }
 
     response["TYPE"] = "MISSION_SUBMITTED";
@@ -2079,6 +2652,8 @@ json handle_mission_submit(const json& msg)
     response["STATUS"] = current_status;
     response["ASSIGNED_DRONE"] = (mission_type == "FORMATION") ? "" : assigned_drone;
     response["ASSIGNMENTS"] = assignments;
+    if (!queue_reason.empty())
+        response["QUEUE_REASON"] = queue_reason;
 
     if (mission_type == "FORMATION")
     {

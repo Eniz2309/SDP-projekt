@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 14
+// AUTONOMNI DRONOVI - VERZIJA 15
 // Fajl: regional_server.cpp
-// Dodano: prijem, lokalno cuvanje i prosljedjivanje prosirene
-//         telemetrije: misija, rezim leta, senzori, brzina i smjer.
+// Dodano: bez promjene hijerarhije; regionalni prosljedjuje assignment
+//         sa sigurnom visinom koju je odredio centralni route scheduler.
 // ============================================================
 
 #include <boost/asio.hpp>

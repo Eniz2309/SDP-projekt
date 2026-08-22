@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 14
+// AUTONOMNI DRONOVI - VERZIJA 15
 // Fajl: drone_client.cpp
-// Dodano: prosirena TELEMETRY/KEEPALIVE poruka sa aktivnom misijom,
-//         tipom misije, rezimom leta i simuliranim statusom senzora.
+// Dodano: bez promjene klijentskog protokola; dron izvrsava visinu
+//         koju centralni scheduler odabere nakon provjere konflikta ruta.
 // ============================================================
 
 #include <boost/asio.hpp>

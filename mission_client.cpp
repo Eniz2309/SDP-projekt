@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 14
+// AUTONOMNI DRONOVI - VERZIJA 15
 // Fajl: mission_client.cpp
-// Dodano: nema promjene operator CLI protokola; ostaje kompatibilan
-//         sa prosirenim registrom telemetrije na serverima.
+// Dodano: operator CLI ostaje kompatibilan; odgovori mogu sadrzati
+//         QUEUE_REASON ili odbijanje PARAMS zbog konflikta planiranih ruta.
 // ============================================================
 
 #include <boost/asio.hpp>

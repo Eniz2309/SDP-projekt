@@ -202,3 +202,31 @@ PEER_KEY=ML-DSA-44
 ```
 
 UDP TELEMETRY/KEEPALIVE se salju kao AES-256-GCM envelope sa `NONCE`, `TAG` i `CIPHERTEXT` poljima.
+
+## Detekcija konflikta ruta
+
+Centralni scheduler prije aktivacije misije gradi geometriju stvarne planirane putanje i poredi je sa svim aktivnim misijama u istom regionu. Konture se modeliraju kao segmenti kvadratne rute, dok se DELIVERY modelira kao stvarna putanja `trenutna pozicija -> izlaz sa konture -> dostavna tacka`.
+
+Konflikt postoji kada su dvije putanje blize od horizontalne sigurnosne udaljenosti, a istovremeno nemaju dovoljno vertikalno razdvajanje. Scheduler tada automatski proba sljedeci visinski slot. Ako nijedan slot nije siguran, misija ostaje `QUEUED` i u bazi/odgovoru dobija `QUEUE_REASON=ROUTE_CONFLICT_NO_SAFE_ALTITUDE`. Nema prekidanja vec aktivne misije.
+
+Ista provjera se koristi i za rucni `PARAMS` zahtjev za promjenu visine. Ako bi nova visina napravila konflikt sa drugom aktivnom putanjom, centralni vraca `CONTROL_REJECTED` sa razlogom `ROUTE_CONFLICT_AT_REQUESTED_ALTITUDE`. Visinu clana aktivne formacije operator ne mijenja pojedinacno jer je zajednicku visinu odredio formation scheduler.
+
+Za provjeru stanja:
+
+```bash
+sqlite3 central_server.db
+```
+
+```sql
+.headers on
+.mode column
+SELECT mission_id, mission_type, route_id, altitude, altitude_slot, status, queue_reason
+FROM missions
+ORDER BY created_at;
+```
+
+Kada scheduler otkrije presjek/blizinu, centralni server ispisuje `[CENTRAL][ROUTE] konflikt...`; ako je moguce vertikalno razdvajanje, odmah zatim ispisuje odabranu alternativnu sigurnu visinu.
+
+### Test geometrijskog konflikta
+
+Za jasan test pokreni najmanje cetiri autentifikovana drona. Zatim zauzmi tri visinska slota na `SKENDERIJA_K1` sa tri MONITORING misije na trazenoj visini 120 m. Scheduler ce ih rasporediti na 120, 122 i 124 m. Nakon toga posalji DELIVERY od centra zone prema tacki oko 600 m istocno od centra; ta putanja sijece K1. DELIVERY ce probati 120, 122 i 124 m, detektovati konflikt na sva tri slota i ostati `QUEUED` sa `ROUTE_CONFLICT_NO_SAFE_ALTITUDE`. Kad se jedna od tri monitoring misije zavrsi ili zaustavi, scheduler ponovo pokusava queued misiju i moze iskoristiti oslobodjenu sigurnu visinu.
