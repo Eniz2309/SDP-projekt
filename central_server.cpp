@@ -1,9 +1,9 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 16
+// AUTONOMNI DRONOVI - VERZIJA 17
 // Fajl: central_server.cpp
-// Dodano: dovrsen RTB state machine, AT_BASE/CHARGING stanja,
-//         zastita schedulera od low-battery dronova i provjera
-//         minimalne baterije prije ponovnog AVAILABLE stanja.
+// Dodano: formation failure handling za LOW_BATTERY i CONNECTION_LOST;
+//         kvar bilo kojeg clana prekida cijelu formaciju, zaustavlja
+//         preostale clanove i pravilno oslobada resurse/scheduler.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -837,7 +837,9 @@ RouteConflictInfo find_route_conflict(const std::string& candidate_mission_id,
             FROM missions
             WHERE region_id = ?
               AND mission_id <> ?
-              AND status IN ('ACTIVE', 'STOP_REQUESTED');
+              AND status IN ('ACTIVE', 'STOP_REQUESTED',
+                             'ABORTING_FORMATION_LOW_BATTERY',
+                             'ABORTING_FORMATION_CONNECTION_LOST');
         )");
         q.execute(region_id, candidate_mission_id);
         std::string id;
@@ -946,7 +948,9 @@ bool assign_altitude_slot(const std::string& mission_id,
         auto stmt = g_db->prepare(R"(
             SELECT altitude_slot
             FROM missions
-            WHERE status IN ('ACTIVE', 'STOP_REQUESTED')
+            WHERE status IN ('ACTIVE', 'STOP_REQUESTED',
+                             'ABORTING_FORMATION_LOW_BATTERY',
+                             'ABORTING_FORMATION_CONNECTION_LOST')
               AND region_id = ?
               AND zone = ?
               AND route_id = ?;
@@ -1334,6 +1338,174 @@ void handle_drone_status(const json& msg)
               << " | battery=" << battery << "%" << std::endl;
 }
 
+
+bool find_active_formation_for_drone(const std::string& drone_uri,
+                                     std::string& mission_id)
+{
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        SELECT fm.mission_id
+        FROM formation_members fm
+        JOIN missions m ON m.mission_id = fm.mission_id
+        WHERE fm.drone_uri = ?
+          AND fm.status IN ('ACTIVE', 'STOP_REQUESTED')
+          AND m.status IN ('ACTIVE', 'STOP_REQUESTED')
+        LIMIT 1;
+    )");
+    stmt.execute(drone_uri);
+    return stmt.fetch(mission_id);
+}
+
+json abort_formation_on_member_failure(const std::string& mission_id,
+                                       const std::string& failed_drone,
+                                       const std::string& region_id,
+                                       const std::string& failure_type)
+{
+    json response;
+    std::vector<std::string> members_to_stop;
+    double base_lat = 0.0;
+    double base_lon = 0.0;
+
+    const bool low_battery = (failure_type == "LOW_BATTERY");
+    const std::string aborting_status = low_battery
+        ? "ABORTING_FORMATION_LOW_BATTERY"
+        : "ABORTING_FORMATION_CONNECTION_LOST";
+    const std::string final_status = low_battery
+        ? "ABORTED_FORMATION_LOW_BATTERY"
+        : "ABORTED_FORMATION_CONNECTION_LOST";
+    const std::string failed_member_status = low_battery
+        ? "FAILED_LOW_BATTERY"
+        : "FAILED_CONNECTION_LOST";
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        if (low_battery)
+        {
+            auto q = g_db->prepare("SELECT base_lat FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id);
+            if (!q.fetch(base_lat))
+            {
+                response["TYPE"] = "ERROR";
+                response["MESSAGE"] = "BASE_NOT_FOUND_FOR_REGION";
+                return response;
+            }
+
+            q = g_db->prepare("SELECT base_lon FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id);
+            q.fetch(base_lon);
+        }
+
+        // Misija prelazi u ABORTING dok ostali clanovi stvarno ne potvrde STOP.
+        // Ruta/visinski slot zato ostaju rezervisani tokom sigurnog gasenja formacije.
+        auto mission_stmt = g_db->prepare(R"(
+            UPDATE missions
+            SET status = ?
+            WHERE mission_id = ?
+              AND status IN ('ACTIVE', 'STOP_REQUESTED');
+        )");
+        mission_stmt.execute(aborting_status, mission_id);
+
+        auto failed_member_stmt = g_db->prepare(R"(
+            UPDATE formation_members
+            SET status = ?
+            WHERE mission_id = ? AND drone_uri = ?;
+        )");
+        failed_member_stmt.execute(failed_member_status, mission_id, failed_drone);
+
+        auto other_members_stmt = g_db->prepare(R"(
+            UPDATE formation_members
+            SET status = 'STOP_REQUESTED'
+            WHERE mission_id = ?
+              AND drone_uri != ?
+              AND status = 'ACTIVE';
+        )");
+        other_members_stmt.execute(mission_id, failed_drone);
+
+        // Neispravni clan odmah izlazi iz aktivne mission/route evidencije.
+        if (low_battery)
+        {
+            auto drone_stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'RETURN_TO_BASE', route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'RTB', last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            drone_stmt.execute(failed_drone);
+        }
+        else
+        {
+            auto drone_stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'CONNECTION_LOST', route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'CONNECTION_LOST', last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            drone_stmt.execute(failed_drone);
+        }
+
+        // Ostali clanovi ostaju BUSY dok stvarno ne potvrde STOP_MISSION.
+        auto q = g_db->prepare(R"(
+            SELECT drone_uri
+            FROM formation_members
+            WHERE mission_id = ? AND status = 'STOP_REQUESTED'
+            ORDER BY member_index ASC;
+        )");
+        q.execute(mission_id);
+        std::string member;
+        while (q.fetch(member))
+            members_to_stop.push_back(member);
+    }
+
+    json commands = json::array();
+    for (const auto& member : members_to_stop)
+    {
+        json command;
+        command["TYPE"] = "STOP_MISSION";
+        command["MISSION_ID"] = mission_id;
+        command["DRONE_URI"] = member;
+        command["REASON"] = "FORMATION_MEMBER_" + failure_type;
+        command["FORMATION"] = true;
+        command["FAILED_DRONE"] = failed_drone;
+        commands.push_back(command);
+    }
+
+    response["TYPE"] = "FORMATION_FAILURE_DISPATCH";
+    response["MISSION_ID"] = mission_id;
+    response["REGION_ID"] = region_id;
+    response["FAILED_DRONE"] = failed_drone;
+    response["FAILURE_TYPE"] = failure_type;
+    response["MISSION_STATUS"] = aborting_status;
+    response["FINAL_MISSION_STATUS"] = final_status;
+    response["COMMANDS"] = commands;
+
+    // LOW_BATTERY clan jos ima vezu, pa regionalni ovu komandu vraca bas njemu.
+    if (low_battery)
+    {
+        json failed_command;
+        failed_command["TYPE"] = "RETURN_TO_BASE";
+        failed_command["DRONE_URI"] = failed_drone;
+        failed_command["BASE_LAT"] = base_lat;
+        failed_command["BASE_LON"] = base_lon;
+        failed_command["REASON"] = "LOW_BATTERY";
+        failed_command["FORMATION_ABORTED"] = true;
+        failed_command["MISSION_ID"] = mission_id;
+        response["FAILED_DRONE_COMMAND"] = failed_command;
+    }
+
+    // Novi zadaci se ne rasporeduju dok preostali clanovi ne potvrde STOP.
+    // Posljednji ACK_STOP finalizira ABORTED_* i tek tada pokrece scheduler.
+    response["ASSIGNMENTS"] = json::array();
+
+    std::cout << "[CENTRAL][FORMATION][FAILURE] mission=" << mission_id
+              << " | failed=" << failed_drone
+              << " | type=" << failure_type
+              << " | stop_remaining=" << members_to_stop.size()
+              << std::endl;
+
+    return response;
+}
+
 json handle_alarm(const json& msg)
 {
     json response;
@@ -1356,6 +1528,18 @@ json handle_alarm(const json& msg)
 
     std::cout << "[CENTRAL] Alarm za " << drone_uri
               << " | " << alarm_type << std::endl;
+
+    // Formation se tretira kao jedna koordinisana misija. Kvar bilo kojeg clana
+    // prekida cijelu formaciju, neovisno o tome koji clan je upisan u missions.drone_uri.
+    if (alarm_type == "LOW_BATTERY" || alarm_type == "CONNECTION_LOST")
+    {
+        std::string formation_mission_id;
+        if (find_active_formation_for_drone(drone_uri, formation_mission_id))
+        {
+            return abort_formation_on_member_failure(
+                formation_mission_id, drone_uri, region_id, alarm_type);
+        }
+    }
 
     if (alarm_type == "CONNECTION_LOST")
     {
@@ -1508,19 +1692,32 @@ json handle_ack_stop(const json& msg)
             )");
             drone_stmt.execute(drone_uri);
 
+            // FAILED_* clan vise ne ceka ACK_STOP. Brojimo samo clanove kojima
+            // jos uvijek treba stvarna STOP potvrda.
             auto count_stmt = g_db->prepare(R"(
                 SELECT COUNT(*) FROM formation_members
-                WHERE mission_id = ? AND status != 'STOPPED';
+                WHERE mission_id = ? AND status IN ('ACTIVE', 'STOP_REQUESTED');
             )");
             count_stmt.execute(mission_id);
             count_stmt.fetch(remaining);
 
             if (remaining == 0)
             {
+                // Posljednji ACK_STOP finalizira razlog prekida. Operator STOP
+                // postaje STOPPED, a failure tok zadrzava konkretan ABORTED razlog.
                 auto mission_stmt = g_db->prepare(R"(
                     UPDATE missions
-                    SET status = 'STOPPED', finished_at = CURRENT_TIMESTAMP
-                    WHERE mission_id = ? AND status IN ('ACTIVE', 'STOP_REQUESTED');
+                    SET status = CASE status
+                        WHEN 'STOP_REQUESTED' THEN 'STOPPED'
+                        WHEN 'ABORTING_FORMATION_LOW_BATTERY' THEN 'ABORTED_FORMATION_LOW_BATTERY'
+                        WHEN 'ABORTING_FORMATION_CONNECTION_LOST' THEN 'ABORTED_FORMATION_CONNECTION_LOST'
+                        ELSE status
+                    END,
+                    finished_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ?
+                      AND status IN ('STOP_REQUESTED',
+                                     'ABORTING_FORMATION_LOW_BATTERY',
+                                     'ABORTING_FORMATION_CONNECTION_LOST');
                 )");
                 mission_stmt.execute(mission_id);
             }

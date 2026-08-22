@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 16
+// AUTONOMNI DRONOVI - VERZIJA 17
 // Fajl: regional_server.cpp
-// Dodano: ACK_RTB sada predstavlja dolazak u bazu i regionalni
-//         propagira AT_BASE ili AT_BASE_LOW_BATTERY prema centralnom.
+// Dodano: formation failure dispatch; regionalni gasi virtualnog leadera,
+//         salje STOP preostalim clanovima i LOW_BATTERY clanu prosljeduje RTB.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -667,6 +667,50 @@ void set_local_connection_lost(const std::string& drone_uri)
     stmt.execute(drone_uri);
 }
 
+
+int dispatch_formation_failure(const json& central_response)
+{
+    if (central_response.value("TYPE", "") != "FORMATION_FAILURE_DISPATCH")
+        return 0;
+
+    const std::string mission_id =
+        central_response.value("MISSION_ID", "UNKNOWN_MISSION");
+    const std::string failed_drone =
+        central_response.value("FAILED_DRONE", "UNKNOWN_DRONE");
+    const std::string failure_type =
+        central_response.value("FAILURE_TYPE", "UNKNOWN_FAILURE");
+
+    // Virtualni leader vise ne smije slati FORMATION_UPDATE poruke.
+    stop_formation_controller(mission_id);
+
+    int delivered = 0;
+    if (central_response.contains("COMMANDS") &&
+        central_response["COMMANDS"].is_array())
+    {
+        for (const auto& command : central_response["COMMANDS"])
+        {
+            const std::string target =
+                command.value("DRONE_URI", "UNKNOWN_DRONE");
+            if (send_to_drone(target, command))
+                ++delivered;
+            else
+                std::cerr << "[REGIONAL][FORMATION][FAILURE] STOP nije isporucen "
+                          << target << std::endl;
+        }
+    }
+
+    // Scheduler se pokrece tek nakon posljednjeg ACK_STOP, kada su preostali
+    // clanovi stvarno izasli iz formacije i ruta je sigurno oslobodena.
+
+    std::cout << "[REGIONAL][FORMATION][FAILURE] mission=" << mission_id
+              << " | failed=" << failed_drone
+              << " | type=" << failure_type
+              << " | stop_delivered=" << delivered
+              << std::endl;
+
+    return delivered;
+}
+
 void watchdog_loop()
 {
     std::cout << "[REGIONAL][WATCHDOG] Pokrenut. Timeout="
@@ -743,6 +787,9 @@ void watchdog_loop()
             try
             {
                 json central_response = send_to_central(alarm);
+                if (central_response.value("TYPE", "") == "FORMATION_FAILURE_DISPATCH")
+                    dispatch_formation_failure(central_response);
+
                 std::cout << "[REGIONAL][WATCHDOG] Centralni odgovor: "
                           << central_response.dump() << std::endl;
             }
@@ -886,7 +933,24 @@ json handle_drone_message(json msg)
 
         json central_response = send_to_central(msg);
 
-        if (central_response.value("TYPE", "") == "RETURN_TO_BASE")
+        if (central_response.value("TYPE", "") == "FORMATION_FAILURE_DISPATCH")
+        {
+            int delivered = dispatch_formation_failure(central_response);
+
+            // Kod LOW_BATTERY failing clan jos ima aktivnu sesiju i dobija RTB.
+            if (central_response.contains("FAILED_DRONE_COMMAND"))
+            {
+                response = central_response["FAILED_DRONE_COMMAND"];
+                response["STOP_COMMANDS_DELIVERED"] = delivered;
+            }
+            else
+            {
+                response["TYPE"] = "ACK_ALARM";
+                response["FORMATION_ABORTED"] = true;
+                response["CENTRAL_RESPONSE"] = central_response;
+            }
+        }
+        else if (central_response.value("TYPE", "") == "RETURN_TO_BASE")
         {
             response = central_response;
 
@@ -1077,7 +1141,7 @@ json handle_drone_message(json msg)
         status_msg["TYPE"] = "DRONE_STATUS";
         status_msg["DRONE_URI"] = drone_uri;
         status_msg["BATTERY"] = msg.value("BATTERY", -1);
-        status_msg["STATUS"] = "IDLE";
+        status_msg["STATUS"] = "AVAILABLE";
         status_msg["LAT"] = msg.value("LAT", 0.0);
         status_msg["LON"] = msg.value("LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);

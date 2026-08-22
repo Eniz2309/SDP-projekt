@@ -26,6 +26,7 @@ Dronovi komuniciraju iskljucivo sa pripadajucim regionalnim serverom. Direktna k
 - MONITORING, DELIVERY, INSPECTION i TEST_FLIGHT misije
 - prioritetni red zadataka
 - FORMATION sa regionalnim serverom kao virtualnim leaderom
+- prekid cijele formacije ako bilo koji clan prijavi LOW_BATTERY ili izgubi vezu
 - STOP_MISSION, promjena parametara leta i rucni RTB
 - LOW_BATTERY i CONNECTION_LOST alarmi
 - UDP TELEMETRY i KEEPALIVE sa zadatkom, rezimom leta i statusom senzora
@@ -73,6 +74,12 @@ DRONE_URI TOKEN
 Centralni server ne cuva raw token u SQLite bazi. Cuva SHA-256 hash i provjerava URI, token, `enabled` stanje i region kojem je dron vezan.
 
 `drone_credentials.conf` je u `.gitignore` i ne treba ga commitovati ako sadrzi stvarne tokene.
+
+## Formation failure handling
+
+Formacija se tretira kao jedna koordinisana misija. Ako bilo koji clan dobije `LOW_BATTERY` ili `CONNECTION_LOST`, centralni server pronalazi njegovu aktivnu formaciju preko `formation_members`, oznacava formaciju prekinutom i regionalnom serveru salje `STOP_MISSION` za sve preostale clanove.
+
+Kod `LOW_BATTERY` neispravni clan dobija `RETURN_TO_BASE`, a ostali clanovi postaju raspolozivi tek nakon sto potvrde `ACK_STOP`. Kod `CONNECTION_LOST` izgubljenom clanu se ne pokusava slati komanda preko nepostojece veze; ostali clanovi se zaustavljaju i virtualni leader se gasi.
 
 ## Build
 

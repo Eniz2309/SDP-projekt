@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 16
+// AUTONOMNI DRONOVI - VERZIJA 17
 // Fajl: drone_client.cpp
-// Dodano: RTB -> AT_BASE tok, low-battery CHARGING simulacija,
-//         automatski povratak u AVAILABLE tek nakon dovoljne baterije.
+// Dodano: kompatibilnost sa formation failure tokom; STOP_MISSION cisti
+//         formation stanje, a LOW_BATTERY clan koristi postojeci RTB/charging tok.
 // ============================================================
 
 #include <boost/asio.hpp>
