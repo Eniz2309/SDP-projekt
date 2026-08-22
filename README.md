@@ -2,6 +2,9 @@
 
 Studentski projekat protokola za hijerarhijsko upravljanje autonomnim dronovima preko centralnog i regionalnog servera.
 
+export LD_LIBRARY_PATH=/usr/local/openssl/lib64:${LD_LIBRARY_PATH:-}
+export PATH=/usr/local/openssl/bin:$PATH
+
 ## Arhitektura
 
 ```text
