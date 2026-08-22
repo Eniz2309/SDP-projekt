@@ -8,6 +8,7 @@
 // Nema automatskog preemptiona zbog prioriteta; STOP_MISSION ostaje posebna kontrolna komanda.
 // central_server.cpp
 // v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
+// v13_auth: prava URI+TOKEN autentifikacija preko centralnog credential registra.
 // Centralni server za autonomne dronove.
 // Funkcionalnosti:
 // - registracija regionalnih servera sa bazom i zonama
@@ -30,6 +31,10 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <openssl/evp.h>
 
 #include <sqlite3.h>
 #include "json/json.h"
@@ -91,6 +96,103 @@ struct RouteInfo
     }
 };
 
+std::string sha256_hex(const std::string& input)
+{
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        throw std::runtime_error("EVP_MD_CTX_new failed");
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+
+    try
+    {
+        if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1)
+            throw std::runtime_error("EVP_DigestInit_ex(SHA-256) failed");
+        if (EVP_DigestUpdate(ctx, input.data(), input.size()) != 1)
+            throw std::runtime_error("EVP_DigestUpdate failed");
+        if (EVP_DigestFinal_ex(ctx, digest, &digest_len) != 1)
+            throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+    catch (...)
+    {
+        EVP_MD_CTX_free(ctx);
+        throw;
+    }
+
+    EVP_MD_CTX_free(ctx);
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < digest_len; ++i)
+        oss << std::setw(2) << static_cast<unsigned int>(digest[i]);
+    return oss.str();
+}
+
+void load_drone_credentials(const std::string& file_path)
+{
+    std::ifstream file(file_path.c_str());
+    if (!file)
+        throw std::runtime_error("Cannot open drone credentials file: " + file_path);
+
+    int loaded = 0;
+    std::string line;
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Konfiguracioni fajl je autoritativan: credential koji vise nije u
+    // fajlu ostaje u bazi radi evidencije, ali se automatski deaktivira.
+    g_db->execute("UPDATE drone_credentials SET enabled = 0;");
+
+    while (std::getline(file, line))
+    {
+        std::size_t comment = line.find('#');
+        if (comment != std::string::npos)
+            line.erase(comment);
+
+        std::istringstream iss(line);
+        std::string drone_uri;
+        std::string token;
+
+        if (!(iss >> drone_uri >> token))
+            continue;
+
+        const std::string token_hash = sha256_hex(token);
+
+        int count = 0;
+        {
+            auto q = g_db->prepare(
+                "SELECT COUNT(*) FROM drone_credentials WHERE drone_uri = ?;");
+            q.execute(drone_uri);
+            q.fetch(count);
+        }
+
+        if (count == 0)
+        {
+            auto ins = g_db->prepare(R"(
+                INSERT INTO drone_credentials
+                (drone_uri, token_hash, enabled, registered_region, created_at, last_auth_at)
+                VALUES (?, ?, 1, '', CURRENT_TIMESTAMP, NULL);
+            )");
+            ins.execute(drone_uri, token_hash);
+        }
+        else
+        {
+            auto upd = g_db->prepare(R"(
+                UPDATE drone_credentials
+                SET token_hash = ?, enabled = 1
+                WHERE drone_uri = ?;
+            )");
+            upd.execute(token_hash, drone_uri);
+        }
+
+        ++loaded;
+    }
+
+    std::cout << "[CENTRAL][AUTH] Ucitano credentiala: "
+              << loaded << " iz " << file_path << std::endl;
+}
+
 
 void exec_sql(const std::string& sql)
 {
@@ -146,6 +248,17 @@ void init_database()
             altitude INTEGER,
             route_id TEXT,
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    )");
+
+    exec_sql(R"(
+        CREATE TABLE IF NOT EXISTS drone_credentials (
+            drone_uri TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            registered_region TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_auth_at DATETIME
         );
     )");
 
@@ -460,6 +573,194 @@ bool assign_altitude_slot(const std::string& region_id,
     }
 
     return false;
+}
+
+json handle_drone_register(const json& msg)
+{
+    json response;
+
+    const std::string drone_uri = msg.value("DRONE_URI", "");
+    const std::string token = msg.value("TOKEN", "");
+    const std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
+
+    if (drone_uri.empty() || token.empty())
+    {
+        response["TYPE"] = "DRONE_REGISTER_REJECTED";
+        response["REASON"] = "MISSING_URI_OR_TOKEN";
+        return response;
+    }
+
+    const std::string presented_hash = sha256_hex(token);
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    std::string stored_hash;
+    {
+        auto q = g_db->prepare(
+            "SELECT token_hash FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        if (!q.fetch(stored_hash))
+        {
+            response["TYPE"] = "DRONE_REGISTER_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "UNKNOWN_DRONE_URI";
+            std::cout << "[CENTRAL][AUTH] REGISTER odbijen: nepoznat URI "
+                      << drone_uri << std::endl;
+            return response;
+        }
+    }
+
+    int enabled = 0;
+    {
+        auto q = g_db->prepare(
+            "SELECT enabled FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(enabled);
+    }
+
+    if (enabled != 1)
+    {
+        response["TYPE"] = "DRONE_REGISTER_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_DISABLED";
+        return response;
+    }
+
+    if (stored_hash != presented_hash)
+    {
+        response["TYPE"] = "DRONE_REGISTER_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "INVALID_TOKEN";
+        std::cout << "[CENTRAL][AUTH] REGISTER odbijen: pogresan token za "
+                  << drone_uri << std::endl;
+        return response;
+    }
+
+    std::string registered_region;
+    {
+        auto q = g_db->prepare(
+            "SELECT registered_region FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(registered_region);
+    }
+
+    if (!registered_region.empty() && registered_region != region_id)
+    {
+        response["TYPE"] = "DRONE_REGISTER_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_REGISTERED_IN_OTHER_REGION";
+        response["REGISTERED_REGION"] = registered_region;
+        return response;
+    }
+
+    if (registered_region.empty())
+    {
+        auto upd = g_db->prepare(R"(
+            UPDATE drone_credentials
+            SET registered_region = ?
+            WHERE drone_uri = ?;
+        )");
+        upd.execute(region_id, drone_uri);
+    }
+
+    response["TYPE"] = "DRONE_REGISTER_OK";
+    response["DRONE_URI"] = drone_uri;
+    response["REGION_ID"] = region_id;
+
+    std::cout << "[CENTRAL][AUTH] REGISTER OK: "
+              << drone_uri << " @ " << region_id << std::endl;
+    return response;
+}
+
+json handle_drone_auth(const json& msg)
+{
+    json response;
+
+    const std::string drone_uri = msg.value("DRONE_URI", "");
+    const std::string token = msg.value("TOKEN", "");
+    const std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
+
+    if (drone_uri.empty() || token.empty())
+    {
+        response["TYPE"] = "DRONE_AUTH_REJECTED";
+        response["REASON"] = "MISSING_URI_OR_TOKEN";
+        return response;
+    }
+
+    const std::string presented_hash = sha256_hex(token);
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    std::string stored_hash;
+    {
+        auto q = g_db->prepare(
+            "SELECT token_hash FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        if (!q.fetch(stored_hash))
+        {
+            response["TYPE"] = "DRONE_AUTH_REJECTED";
+            response["DRONE_URI"] = drone_uri;
+            response["REASON"] = "UNKNOWN_DRONE_URI";
+            return response;
+        }
+    }
+
+    int enabled = 0;
+    {
+        auto q = g_db->prepare(
+            "SELECT enabled FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(enabled);
+    }
+
+    std::string registered_region;
+    {
+        auto q = g_db->prepare(
+            "SELECT registered_region FROM drone_credentials WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(registered_region);
+    }
+
+    if (enabled != 1)
+    {
+        response["TYPE"] = "DRONE_AUTH_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "DRONE_DISABLED";
+        return response;
+    }
+
+    if (registered_region.empty() || registered_region != region_id)
+    {
+        response["TYPE"] = "DRONE_AUTH_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "REGION_MISMATCH";
+        return response;
+    }
+
+    if (stored_hash != presented_hash)
+    {
+        response["TYPE"] = "DRONE_AUTH_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = "INVALID_TOKEN";
+        std::cout << "[CENTRAL][AUTH] AUTH odbijen: pogresan token za "
+                  << drone_uri << std::endl;
+        return response;
+    }
+
+    auto upd = g_db->prepare(R"(
+        UPDATE drone_credentials
+        SET last_auth_at = CURRENT_TIMESTAMP
+        WHERE drone_uri = ?;
+    )");
+    upd.execute(drone_uri);
+
+    response["TYPE"] = "DRONE_AUTH_OK";
+    response["DRONE_URI"] = drone_uri;
+    response["REGION_ID"] = region_id;
+
+    std::cout << "[CENTRAL][AUTH] AUTH OK: "
+              << drone_uri << " @ " << region_id << std::endl;
+    return response;
 }
 
 void handle_region_register(const json& msg)
@@ -1928,6 +2229,14 @@ private:
                 response["TYPE"] = "ACK";
                 response["MESSAGE"] = "REGION_REGISTERED";
             }
+            else if (type == "DRONE_REGISTER")
+            {
+                response = handle_drone_register(msg);
+            }
+            else if (type == "DRONE_AUTH")
+            {
+                response = handle_drone_auth(msg);
+            }
             else if (type == "DRONE_STATUS")
             {
                 handle_drone_status(msg);
@@ -2053,6 +2362,10 @@ int main(int argc, char* argv[])
     {
         g_db.reset(new sqlite::db("central_server.db"));
         init_database();
+
+        const std::string credentials_file =
+            sdpsec::env_or("SDP_DRONE_CREDENTIALS_FILE", "drone_credentials.conf");
+        load_drone_credentials(credentials_file);
 
         const std::string cert_file =
             (argc == 4) ? argv[2] : sdpsec::env_or("SDP_CENTRAL_CERT", "central-cert.pem");
