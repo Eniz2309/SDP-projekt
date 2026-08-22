@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 15
+// AUTONOMNI DRONOVI - VERZIJA 16
 // Fajl: regional_server.cpp
-// Dodano: bez promjene hijerarhije; regionalni prosljedjuje assignment
-//         sa sigurnom visinom koju je odredio centralni route scheduler.
+// Dodano: ACK_RTB sada predstavlja dolazak u bazu i regionalni
+//         propagira AT_BASE ili AT_BASE_LOW_BATTERY prema centralnom.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -903,21 +903,34 @@ json handle_drone_message(json msg)
     else if (type == "DRONE_READY")
     {
         std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+
+        msg["TYPE"] = "DRONE_READY";
+        response = send_to_central(msg);
+
         json status_msg;
         status_msg["TYPE"] = "DRONE_STATUS";
         status_msg["DRONE_URI"] = drone_uri;
         status_msg["BATTERY"] = msg.value("BATTERY", -1);
-        status_msg["STATUS"] = "AVAILABLE";
         status_msg["LAT"] = msg.value("LAT", 0.0);
         status_msg["LON"] = msg.value("LON", 0.0);
         status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
         status_msg["ROUTE_ID"] = "";
         copy_telemetry_context(status_msg, msg);
-        save_drone_status(status_msg);
+        status_msg["MISSION_ID"] = "";
+        status_msg["MISSION_TYPE"] = "";
 
-        msg["TYPE"] = "DRONE_READY";
-        response = send_to_central(msg);
-        dispatch_assignments(response);
+        if (response.value("TYPE", "") == "ACK_DRONE_READY")
+        {
+            status_msg["STATUS"] = "AVAILABLE";
+            status_msg["FLIGHT_MODE"] = "STANDBY";
+            save_drone_status(status_msg);
+        }
+        else
+        {
+            status_msg["STATUS"] = response.value("STATUS", "CHARGING");
+            status_msg["FLIGHT_MODE"] = "GROUND";
+            save_drone_status(status_msg);
+        }
     }
     else if (type == "MISSION_SUBMIT" || type == "MISSION_REQUEST")
     {
@@ -1111,33 +1124,41 @@ json handle_drone_message(json msg)
     }
     else if (type == "ACK_RTB")
     {
-        // Potvrda da je dron primio komandu za povratak u bazu.
+        // U simulatoru ACK_RTB znaci da je dron zavrsio povratak i stigao u bazu.
+        // LOW_BATTERY dron ostaje van scheduler pool-a dok se ne napuni.
+        std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        std::string reason = msg.value("REASON", "UNKNOWN_REASON");
+        int battery = msg.value("BATTERY", -1);
+        bool low_battery_return = (reason == "LOW_BATTERY" || (battery >= 0 && battery <= 20));
+        std::string base_status = low_battery_return ? "AT_BASE_LOW_BATTERY" : "AT_BASE";
+
         json status_msg;
         status_msg["TYPE"] = "DRONE_STATUS";
-        status_msg["DRONE_URI"] = msg.value("DRONE_URI", "UNKNOWN_DRONE");
-        status_msg["BATTERY"] = msg.value("BATTERY", -1);
-        status_msg["STATUS"] = "RETURN_TO_BASE";
+        status_msg["DRONE_URI"] = drone_uri;
+        status_msg["BATTERY"] = battery;
+        status_msg["STATUS"] = base_status;
         status_msg["LAT"] = msg.value("BASE_LAT", 0.0);
         status_msg["LON"] = msg.value("BASE_LON", 0.0);
-        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+        status_msg["ALTITUDE"] = 0;
         status_msg["ROUTE_ID"] = "";
         copy_telemetry_context(status_msg, msg);
         status_msg["MISSION_ID"] = "";
         status_msg["MISSION_TYPE"] = "";
-        status_msg["FLIGHT_MODE"] = "RTB";
+        status_msg["FLIGHT_MODE"] = "GROUND";
 
         save_drone_status(status_msg);
         json central_response = send_to_central(status_msg);
 
         response["TYPE"] = "ACK_RTB_SAVED";
-        response["DRONE_URI"] = msg.value("DRONE_URI", "UNKNOWN_DRONE");
-        response["STATUS"] = "RETURN_TO_BASE";
+        response["DRONE_URI"] = drone_uri;
+        response["STATUS"] = base_status;
+        response["REASON"] = reason;
         response["CENTRAL_RESPONSE"] = central_response;
 
-        std::cout << "[REGIONAL][CONTROL] ACK_RTB od "
-                  << msg.value("DRONE_URI", "UNKNOWN_DRONE")
-                  << " | baza=" << msg.value("BASE_LAT", 0.0)
-                  << "," << msg.value("BASE_LON", 0.0) << std::endl;
+        std::cout << "[REGIONAL][RTB] " << drone_uri
+                  << " stigao u bazu | status=" << base_status
+                  << " | battery=" << battery << "%"
+                  << " | reason=" << reason << std::endl;
     }
     else
     {
@@ -1222,6 +1243,14 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
             {
                 std::lock_guard<std::mutex> write_lock(connection->write_mutex);
                 boost::asio::write(*connection->stream, boost::asio::buffer(out));
+            }
+
+            // Kod DRONE_READY prvo potvrdi AVAILABLE dronu, pa tek onda salji
+            // eventualni START_MISSION. Time ACK ne moze pregaziti novo ON_MISSION stanje.
+            if (msg.value("TYPE", "") == "DRONE_READY" &&
+                response.value("TYPE", "") == "ACK_DRONE_READY")
+            {
+                dispatch_assignments(response);
             }
         }
     }

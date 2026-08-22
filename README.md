@@ -230,3 +230,39 @@ Kada scheduler otkrije presjek/blizinu, centralni server ispisuje `[CENTRAL][ROU
 ### Test geometrijskog konflikta
 
 Za jasan test pokreni najmanje cetiri autentifikovana drona. Zatim zauzmi tri visinska slota na `SKENDERIJA_K1` sa tri MONITORING misije na trazenoj visini 120 m. Scheduler ce ih rasporediti na 120, 122 i 124 m. Nakon toga posalji DELIVERY od centra zone prema tacki oko 600 m istocno od centra; ta putanja sijece K1. DELIVERY ce probati 120, 122 i 124 m, detektovati konflikt na sva tri slota i ostati `QUEUED` sa `ROUTE_CONFLICT_NO_SAFE_ALTITUDE`. Kad se jedna od tri monitoring misije zavrsi ili zaustavi, scheduler ponovo pokusava queued misiju i moze iskoristiti oslobodjenu sigurnu visinu.
+
+
+## RTB i stanje baterije
+
+Povratak u bazu koristi eksplicitna stanja:
+
+```text
+RETURN_TO_BASE -> AT_BASE -> AVAILABLE
+```
+
+Kod alarma `LOW_BATTERY` tok je:
+
+```text
+RETURN_TO_BASE -> AT_BASE_LOW_BATTERY -> CHARGING -> AT_BASE -> AVAILABLE
+```
+
+U simulatoru je geografski povratak u bazu trenutan, ali stanje povratka i potvrda
+dolaska se protokolski evidentiraju. Low-battery dron se nakon dolaska ne vraća
+odmah scheduleru. Simulirano punjenje povećava bateriju za 10% svake 2 sekunde,
+a `DRONE_READY` se šalje tek na 80%. Centralni server dodatno odbija
+`DRONE_READY` zahtjev ispod tog praga.
+
+
+
+Za brzi test `LOW_BATTERY` scenarija mogu se koristiti samo simulacijske
+environment varijable (normalni default ostaje 100% i pad baterije svake 120 s):
+
+```bash
+SDP_INITIAL_BATTERY=21 SDP_BATTERY_TICK_SECONDS=2 \
+./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 120
+```
+
+Dron se registruje sa 21%, nakon približno 2 s pada na 20%, šalje
+`LOW_BATTERY`, izvršava RTB i ulazi u `CHARGING`. Zatim se u demo režimu puni
+10% svake 2 s do 80%, nakon čega traži `AVAILABLE` od centralnog servera.
+

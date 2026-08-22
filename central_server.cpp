@@ -1,9 +1,9 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 15
+// AUTONOMNI DRONOVI - VERZIJA 16
 // Fajl: central_server.cpp
-// Dodano: geometrijska detekcija konflikta planiranih ruta,
-//         horizontalna sigurnosna zona, automatski izbor sigurnog
-//         visinskog slota, QUEUED fallback i zastita CHANGE_PARAMS.
+// Dodano: dovrsen RTB state machine, AT_BASE/CHARGING stanja,
+//         zastita schedulera od low-battery dronova i provjera
+//         minimalne baterije prije ponovnog AVAILABLE stanja.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -44,6 +44,7 @@ const int DEFAULT_VERTICAL_SEPARATION_M = 2;
 const double DEFAULT_HORIZONTAL_ROUTE_SAFETY_M = 20.0;
 const int MIN_FLIGHT_ALTITUDE_M = 20;
 const int MAX_FLIGHT_ALTITUDE_M = 500;
+const int MIN_READY_BATTERY_PERCENT = 80;
 
 struct LocalPoint
 {
@@ -1429,6 +1430,17 @@ json handle_alarm(const json& msg)
             )");
 
             mission_stmt.execute(drone_uri);
+
+            // Od trenutka LOW_BATTERY alarma dron vise nije raspoloziv scheduleru.
+            // Stanje ce nakon potvrde dolaska preci u AT_BASE_LOW_BATTERY/CHARGING.
+            auto drone_stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'RETURN_TO_BASE',
+                    route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'RTB', last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            drone_stmt.execute(drone_uri);
         }
 
         response["TYPE"] = "RETURN_TO_BASE";
@@ -2202,16 +2214,57 @@ json handle_drone_ready(const json& msg)
     json response;
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
     std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
+    int battery = msg.value("BATTERY", -1);
+
+    std::string current_status;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT status FROM drones WHERE drone_uri = ?;");
+        q.execute(drone_uri);
+        q.fetch(current_status);
+    }
+
+    // Posebno je bitno nakon LOW_BATTERY RTB-a: dron ne smije sam sebe
+    // vratiti u scheduler prije nego sto ponovo ima dovoljno energije.
+    // Prag se primjenjuje na recovery stanja, ne na normalnu inicijalnu registraciju.
+    const bool recovering_from_low_battery =
+        (current_status == "AT_BASE_LOW_BATTERY" || current_status == "CHARGING");
+
+    if (recovering_from_low_battery && battery >= 0 &&
+        battery < MIN_READY_BATTERY_PERCENT)
+    {
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'CHARGING', route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'GROUND', battery = ?, last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            stmt.execute(battery, drone_uri);
+        }
+
+        response["TYPE"] = "DRONE_READY_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["STATUS"] = "CHARGING";
+        response["REASON"] = "BATTERY_BELOW_READY_THRESHOLD";
+        response["MIN_BATTERY"] = MIN_READY_BATTERY_PERCENT;
+
+        std::cout << "[CENTRAL][RTB] DRONE_READY odbijen za " << drone_uri
+                  << " | battery=" << battery << "% | potrebno >= "
+                  << MIN_READY_BATTERY_PERCENT << "%" << std::endl;
+        return response;
+    }
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
         auto stmt = g_db->prepare(R"(
             UPDATE drones
             SET status = 'AVAILABLE', route_id = '', mission_id = '', mission_type = '',
-                flight_mode = 'STANDBY', last_seen = CURRENT_TIMESTAMP
+                flight_mode = 'STANDBY', battery = ?, last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
-        stmt.execute(drone_uri);
+        stmt.execute(battery, drone_uri);
     }
 
     response["TYPE"] = "ACK_DRONE_READY";
@@ -2219,7 +2272,8 @@ json handle_drone_ready(const json& msg)
     response["STATUS"] = "AVAILABLE";
     response["ASSIGNMENTS"] = schedule_region(region_id);
 
-    std::cout << "[CENTRAL] Dron " << drone_uri << " je AVAILABLE." << std::endl;
+    std::cout << "[CENTRAL] Dron " << drone_uri << " je AVAILABLE."
+              << " Battery=" << battery << "%" << std::endl;
     return response;
 }
 
@@ -2284,11 +2338,14 @@ json handle_change_params_request(const json& msg)
         return response;
     }
 
-    if (drone_status == "RETURN_TO_BASE")
+    if (drone_status == "RETURN_TO_BASE" || drone_status == "AT_BASE_LOW_BATTERY" ||
+        drone_status == "CHARGING")
     {
         response["TYPE"] = "CONTROL_REJECTED";
         response["DRONE_URI"] = drone_uri;
-        response["REASON"] = "DRONE_RETURNING_TO_BASE";
+        response["REASON"] = (drone_status == "RETURN_TO_BASE")
+                                 ? "DRONE_RETURNING_TO_BASE"
+                                 : "DRONE_NOT_FLIGHT_READY";
         return response;
     }
 
@@ -2500,6 +2557,17 @@ json handle_manual_rtb_request(const json& msg)
         response["TYPE"] = "RTB_REJECTED";
         response["DRONE_URI"] = drone_uri;
         response["REASON"] = "DRONE_CONNECTION_LOST";
+        return response;
+    }
+
+    if (drone_status == "RETURN_TO_BASE" || drone_status == "AT_BASE_LOW_BATTERY" ||
+        drone_status == "CHARGING")
+    {
+        response["TYPE"] = "RTB_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["REASON"] = (drone_status == "RETURN_TO_BASE")
+                                 ? "DRONE_ALREADY_RETURNING_TO_BASE"
+                                 : "DRONE_ALREADY_AT_BASE_NOT_FLIGHT_READY";
         return response;
     }
 

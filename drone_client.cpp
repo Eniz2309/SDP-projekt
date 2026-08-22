@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 15
+// AUTONOMNI DRONOVI - VERZIJA 16
 // Fajl: drone_client.cpp
-// Dodano: bez promjene klijentskog protokola; dron izvrsava visinu
-//         koju centralni scheduler odabere nakon provjere konflikta ruta.
+// Dodano: RTB -> AT_BASE tok, low-battery CHARGING simulacija,
+//         automatski povratak u AVAILABLE tek nakon dovoljne baterije.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -14,6 +14,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
 
 #include "json/json.h"
 #include "pqc_tls_utils.h"
@@ -36,6 +37,23 @@ struct InspectionPoint
     GeoPoint position;
 };
 
+int env_int(const char* name, int fallback, int min_value, int max_value)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value)
+        return fallback;
+
+    try
+    {
+        int parsed = std::stoi(value);
+        return std::max(min_value, std::min(max_value, parsed));
+    }
+    catch (...)
+    {
+        return fallback;
+    }
+}
+
 class DroneClient
 {
 public:
@@ -56,6 +74,7 @@ public:
           keepalive_timer_(io),
           telemetry_timer_(io),
           battery_timer_(io),
+          charging_timer_(io),
           host_(host),
           port_(tcp_port),
           udp_port_(udp_port),
@@ -68,7 +87,8 @@ public:
           mission_id_(""),
           delivery_lat_(0.0),
           delivery_lon_(0.0),
-          battery_(100),
+          battery_(env_int("SDP_INITIAL_BATTERY", 100, 1, 100)),
+          battery_tick_seconds_(env_int("SDP_BATTERY_TICK_SECONDS", 120, 1, 3600)),
           lat_(43.8563),
           lon_(18.4131),
           altitude_(base_altitude),
@@ -83,6 +103,8 @@ public:
           package_delivered_(false),
           mission_finished_sent_(false),
           low_battery_alarm_sent_(false),
+          charging_active_(false),
+          rtb_reason_(""),
           formation_mode_(false),
           formation_offset_north_m_(0.0),
           formation_offset_east_m_(0.0),
@@ -177,6 +199,10 @@ private:
     {
         if (status_ == "RETURN_TO_BASE")
             return "RTB";
+
+        if (status_ == "AT_BASE" || status_ == "AT_BASE_LOW_BATTERY" ||
+            status_ == "CHARGING")
+            return "GROUND";
 
         if (status_ == "FORMATION" || formation_mode_)
             return "FORMATION";
@@ -284,15 +310,19 @@ private:
 
     void start_battery_timer()
     {
-        battery_timer_.expires_after(std::chrono::seconds(120));
+        battery_timer_.expires_after(std::chrono::seconds(battery_tick_seconds_));
 
         battery_timer_.async_wait(
             [this](boost::system::error_code ec)
             {
                 if (!ec)
                 {
-                    if (status_ != "AVAILABLE" && status_ != "IDLE" &&
-                        status_ != "REGISTERED" && battery_ > 0)
+                    const bool flying =
+                        (status_ == "ON_MISSION" || status_ == "DELIVERY_APPROACH" ||
+                         status_ == "DELIVERING" || status_ == "FORMATION" ||
+                         status_ == "RETURN_TO_BASE");
+
+                    if (flying && battery_ > 0)
                     {
                         battery_ -= 1;
 
@@ -320,6 +350,13 @@ private:
         msg["DRONE_URI"] = drone_uri_;
         msg["ALARM_TYPE"] = "LOW_BATTERY";
         msg["MESSAGE"] = "Battery below 20 percent";
+        msg["BATTERY"] = battery_;
+        msg["STATUS"] = status_;
+        msg["LAT"] = lat_;
+        msg["LON"] = lon_;
+        msg["ALTITUDE"] = altitude_;
+        msg["ROUTE_ID"] = active_route_id_;
+        add_telemetry_context(msg);
 
         send_json(msg);
 
@@ -338,9 +375,57 @@ private:
         msg["ALTITUDE"] = altitude_;
         msg["ROUTE_ID"] = "";
         add_telemetry_context(msg);
+        msg["MISSION_ID"] = "";
+        msg["MISSION_TYPE"] = "";
+        msg["FLIGHT_MODE"] = "STANDBY";
         send_json(msg);
 
         std::cout << "[DRONE] Ready for assignment. STATUS=AVAILABLE" << std::endl;
+    }
+
+    void start_charging()
+    {
+        if (charging_active_)
+            return;
+
+        charging_active_ = true;
+        status_ = "CHARGING";
+        active_route_id_.clear();
+        mission_id_.clear();
+        mission_type_.clear();
+
+        std::cout << "[DRONE][RTB] CHARGING started at " << battery_
+                  << "%. Ready threshold=80%." << std::endl;
+        schedule_charge_step();
+    }
+
+    void schedule_charge_step()
+    {
+        charging_timer_.expires_after(std::chrono::seconds(2));
+        charging_timer_.async_wait(
+            [this](boost::system::error_code ec)
+            {
+                if (ec || !charging_active_)
+                    return;
+
+                battery_ = std::min(100, battery_ + 10);
+                std::cout << "[DRONE][RTB] CHARGING " << battery_ << "%" << std::endl;
+
+                if (battery_ >= 80)
+                {
+                    charging_active_ = false;
+                    low_battery_alarm_sent_ = false;
+                    status_ = "AT_BASE";
+                    rtb_reason_.clear();
+
+                    std::cout << "[DRONE][RTB] Battery ready. Requesting AVAILABLE state."
+                              << std::endl;
+                    send_drone_ready();
+                    return;
+                }
+
+                schedule_charge_step();
+            });
     }
 
     void finish_mission()
@@ -635,6 +720,16 @@ private:
                 status_ = "AVAILABLE";
                 std::cout << "[DRONE] Central confirms AVAILABLE state.\n";
             }
+            else if (type == "DRONE_READY_REJECTED")
+            {
+                status_ = msg.value("STATUS", "CHARGING");
+                std::cerr << "[DRONE][RTB] AVAILABLE rejected: "
+                          << msg.value("REASON", "UNKNOWN_REASON")
+                          << " | min_battery=" << msg.value("MIN_BATTERY", 80)
+                          << "%" << std::endl;
+                if (status_ == "CHARGING")
+                    start_charging();
+            }
             else if (type == "START_FORMATION")
             {
                 mission_id_ = msg.value("MISSION_ID", mission_id_);
@@ -806,7 +901,23 @@ private:
             }
             else if (type == "ACK_RTB_SAVED")
             {
-                std::cout << "[DRONE] Regional/central recorded RETURN_TO_BASE state.\n";
+                std::string saved_status = msg.value("STATUS", "AT_BASE");
+                status_ = saved_status;
+
+                std::cout << "[DRONE][RTB] Regional/central confirmed base arrival. "
+                          << "STATUS=" << saved_status << std::endl;
+
+                if (saved_status == "AT_BASE_LOW_BATTERY")
+                {
+                    start_charging();
+                }
+                else
+                {
+                    // Manualni RTB je zavrsen. Dron je na bazi i moze ponovo
+                    // zatraziti ulazak u AVAILABLE pool.
+                    rtb_reason_.clear();
+                    send_drone_ready();
+                }
             }
             else if (type == "CHANGE_PARAMS")
             {
@@ -816,7 +927,9 @@ private:
             {
                 double base_lat = msg.value("BASE_LAT", lat_);
                 double base_lon = msg.value("BASE_LON", lon_);
+                rtb_reason_ = msg.value("REASON", "UNKNOWN_REASON");
 
+                charging_active_ = false;
                 status_ = "RETURN_TO_BASE";
                 active_route_id_.clear();
                 route_points_.clear();
@@ -837,10 +950,15 @@ private:
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
                 lat_ = base_lat;
                 lon_ = base_lon;
+                altitude_ = 0;
 
                 std::cout << "[DRONE] Returning to base because of "
                           << msg.value("REASON", "UNKNOWN_REASON")
                           << ": " << base_lat << ", " << base_lon << std::endl;
+
+                // Simulator trenutno modelira instantni dolazak u bazu.
+                // Zato ACK_RTB oznacava zavrsen povratak, ne samo prijem komande.
+                status_ = "AT_BASE";
 
                 json ack;
                 ack["TYPE"] = "ACK_RTB";
@@ -852,7 +970,8 @@ private:
                 ack["STATUS"] = status_;
                 ack["ROUTE_ID"] = active_route_id_;
                 add_telemetry_context(ack);
-                ack["REASON"] = msg.value("REASON", "UNKNOWN_REASON");
+                ack["REASON"] = rtb_reason_;
+                ack["ARRIVAL_CONFIRMED"] = true;
                 send_json(ack);
             }
             else if (type == "STOP_MISSION")
@@ -1035,6 +1154,7 @@ private:
     boost::asio::steady_timer keepalive_timer_;
     boost::asio::steady_timer telemetry_timer_;
     boost::asio::steady_timer battery_timer_;
+    boost::asio::steady_timer charging_timer_;
 
     std::deque<std::string> write_queue_;
 
@@ -1054,6 +1174,7 @@ private:
     double delivery_lon_;
 
     int battery_;
+    int battery_tick_seconds_;
     double lat_;
     double lon_;
     int altitude_;
@@ -1075,6 +1196,8 @@ private:
     bool package_delivered_;
     bool mission_finished_sent_;
     bool low_battery_alarm_sent_;
+    bool charging_active_;
+    std::string rtb_reason_;
 
     bool formation_mode_;
     std::string formation_id_;

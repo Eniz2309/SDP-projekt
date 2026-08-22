@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 15
+// AUTONOMNI DRONOVI - VERZIJA 16
 // Fajl: mission_client.cpp
-// Dodano: operator CLI ostaje kompatibilan; odgovori mogu sadrzati
-//         QUEUE_REASON ili odbijanje PARAMS zbog konflikta planiranih ruta.
+// Dodano: operator CLI ostaje kompatibilan sa dovrsenim RTB tokom;
+//         MANUAL RTB koristi ista imena komandi kao i ranije.
 // ============================================================
 
 #include <boost/asio.hpp>

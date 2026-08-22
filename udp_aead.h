@@ -1,5 +1,5 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 15
+// AUTONOMNI DRONOVI - VERZIJA 16
 // Fajl: udp_aead.h
 // Dodano: bez funkcionalnih promjena; zadrzana AES-256-GCM
 //         zastita UDP TELEMETRY/KEEPALIVE payload-a.
