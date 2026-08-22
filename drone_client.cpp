@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: drone_client.cpp
-// Dodano: kompatibilnost sa formation failure tokom; STOP_MISSION cisti
-//         formation stanje, a LOW_BATTERY clan koristi postojeci RTB/charging tok.
+// Dodano: lokalni failsafe RTB pri gubitku TCP/TLS veze, SIGNAL_LOSS
+//         simulacija/alarm, SIGNAL_STRENGTH telemetrija i UDP anti-replay SEQ.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <cstdint>
 
 #include "json/json.h"
 #include "pqc_tls_utils.h"
@@ -75,6 +76,7 @@ public:
           telemetry_timer_(io),
           battery_timer_(io),
           charging_timer_(io),
+          signal_timer_(io),
           host_(host),
           port_(tcp_port),
           udp_port_(udp_port),
@@ -89,8 +91,13 @@ public:
           delivery_lon_(0.0),
           battery_(env_int("SDP_INITIAL_BATTERY", 100, 1, 100)),
           battery_tick_seconds_(env_int("SDP_BATTERY_TICK_SECONDS", 120, 1, 3600)),
+          signal_strength_(env_int("SDP_INITIAL_SIGNAL", 100, 0, 100)),
+          signal_tick_seconds_(env_int("SDP_SIGNAL_TICK_SECONDS", 5, 1, 3600)),
+          signal_drop_per_tick_(env_int("SDP_SIGNAL_DROP_PER_TICK", 0, 0, 100)),
           lat_(43.8563),
           lon_(18.4131),
+          base_lat_(43.8563),
+          base_lon_(18.4131),
           altitude_(base_altitude),
           speed_(10),
           direction_("NORTH"),
@@ -103,12 +110,16 @@ public:
           package_delivered_(false),
           mission_finished_sent_(false),
           low_battery_alarm_sent_(false),
+          signal_loss_alarm_sent_(false),
           charging_active_(false),
+          authenticated_(false),
+          connection_loss_failsafe_triggered_(false),
           rtb_reason_(""),
           formation_mode_(false),
           formation_offset_north_m_(0.0),
           formation_offset_east_m_(0.0),
-          udp_key_ready_(false)
+          udp_key_ready_(false),
+          udp_sequence_(0)
     {
         sdpsec::configure_pqc_client(tls_context_, regional_cert);
     }
@@ -201,8 +212,11 @@ private:
             return "RTB";
 
         if (status_ == "AT_BASE" || status_ == "AT_BASE_LOW_BATTERY" ||
-            status_ == "CHARGING")
+            status_ == "AT_BASE_CONNECTION_LOST" || status_ == "CHARGING")
             return "GROUND";
+
+        if (status_ == "CONNECTION_LOST")
+            return "CONNECTION_LOST";
 
         if (status_ == "FORMATION" || formation_mode_)
             return "FORMATION";
@@ -226,6 +240,7 @@ private:
         msg["MISSION_TYPE"] = mission_type_;
         msg["FLIGHT_MODE"] = current_flight_mode();
         msg["SENSOR_STATUS"] = sensor_status_;
+        msg["SIGNAL_STRENGTH"] = signal_strength_;
         msg["SPEED"] = speed_;
         msg["DIRECTION"] = direction_;
     }
@@ -304,6 +319,7 @@ private:
                   << " type=" << (mission_type_.empty() ? "NONE" : mission_type_)
                   << " mode=" << current_flight_mode()
                   << " sensor=" << sensor_status_
+                  << " signal=" << signal_strength_ << "%"
                   << " battery=" << battery_ << "%"
                   << std::endl;
     }
@@ -361,6 +377,120 @@ private:
         send_json(msg);
 
         std::cout << "[DRONE] LOW_BATTERY alarm sent.\n";
+    }
+
+    bool is_flying_state() const
+    {
+        return status_ == "ON_MISSION" ||
+               status_ == "DELIVERY_APPROACH" ||
+               status_ == "DELIVERING" ||
+               status_ == "FORMATION" ||
+               status_ == "RETURN_TO_BASE";
+    }
+
+    void start_signal_timer()
+    {
+        signal_timer_.expires_after(std::chrono::seconds(signal_tick_seconds_));
+        signal_timer_.async_wait(
+            [this](boost::system::error_code ec)
+            {
+                if (ec)
+                    return;
+
+                if (signal_drop_per_tick_ > 0 && is_flying_state())
+                {
+                    signal_strength_ =
+                        std::max(0, signal_strength_ - signal_drop_per_tick_);
+
+                    std::cout << "[DRONE][SIGNAL] Strength="
+                              << signal_strength_ << "%" << std::endl;
+
+                    if (signal_strength_ <= 20 &&
+                        status_ != "RETURN_TO_BASE" &&
+                        !signal_loss_alarm_sent_)
+                    {
+                        signal_loss_alarm_sent_ = true;
+
+                        json msg;
+                        msg["TYPE"] = "ALARM";
+                        msg["DRONE_URI"] = drone_uri_;
+                        msg["ALARM_TYPE"] = "SIGNAL_LOSS";
+                        msg["MESSAGE"] = "Radio signal strength below safe threshold";
+                        msg["BATTERY"] = battery_;
+                        msg["STATUS"] = status_;
+                        msg["LAT"] = lat_;
+                        msg["LON"] = lon_;
+                        msg["ALTITUDE"] = altitude_;
+                        msg["ROUTE_ID"] = active_route_id_;
+                        add_telemetry_context(msg);
+                        send_json(msg);
+
+                        std::cout << "[DRONE][SIGNAL] SIGNAL_LOSS alarm sent."
+                                  << std::endl;
+                    }
+                }
+
+                start_signal_timer();
+            });
+    }
+
+    void clear_active_mission_for_rtb()
+    {
+        active_route_id_.clear();
+        route_points_.clear();
+        current_waypoint_ = 0;
+        inspection_points_.clear();
+        current_inspection_point_ = 0;
+        delivery_mode_ = false;
+        reached_exit_point_ = false;
+        package_delivered_ = false;
+        formation_mode_ = false;
+        formation_id_.clear();
+        formation_offset_north_m_ = 0.0;
+        formation_offset_east_m_ = 0.0;
+        mission_id_.clear();
+        mission_type_.clear();
+    }
+
+    void trigger_connection_loss_failsafe(const std::string& detail)
+    {
+        if (!authenticated_ || connection_loss_failsafe_triggered_)
+            return;
+
+        connection_loss_failsafe_triggered_ = true;
+        udp_key_ready_ = false;
+
+        boost::system::error_code ignored;
+        keepalive_timer_.cancel(ignored);
+        telemetry_timer_.cancel(ignored);
+        signal_timer_.cancel(ignored);
+        charging_timer_.cancel(ignored);
+        charging_active_ = false;
+
+        std::cerr << "[DRONE][FAILSAFE] TCP/TLS veza sa regionalnim serverom je izgubljena: "
+                  << detail << std::endl;
+
+        if (is_flying_state())
+        {
+            rtb_reason_ = "CONNECTION_LOST_LOCAL_FAILSAFE";
+            status_ = "RETURN_TO_BASE";
+            clear_active_mission_for_rtb();
+
+            lat_ = base_lat_;
+            lon_ = base_lon_;
+            altitude_ = 0;
+            status_ = "AT_BASE_CONNECTION_LOST";
+
+            std::cerr << "[DRONE][FAILSAFE] Lokalni RTB zavrsen. "
+                      << "Base=" << base_lat_ << "," << base_lon_
+                      << " STATUS=AT_BASE_CONNECTION_LOST" << std::endl;
+        }
+        else
+        {
+            status_ = "CONNECTION_LOST";
+            std::cerr << "[DRONE][FAILSAFE] Dron nije bio u letu; "
+                      << "STATUS=CONNECTION_LOST." << std::endl;
+        }
     }
 
     void send_drone_ready()
@@ -672,6 +802,7 @@ private:
                 {
                     std::cerr << "[DRONE] Server disconnected: "
                               << ec.message() << std::endl;
+                    trigger_connection_loss_failsafe(ec.message());
                 }
             });
     }
@@ -699,19 +830,27 @@ private:
             }
             else if (type == "AUTH_ERROR")
             {
+                authenticated_ = false;
                 status_ = "AUTH_FAILED";
                 std::cerr << "[DRONE][AUTH] Authentication rejected: "
                           << msg.value("REASON", "UNKNOWN_REASON") << std::endl;
             }
             else if (type == "AUTH_ACK")
             {
+                authenticated_ = true;
+                connection_loss_failsafe_triggered_ = false;
+                base_lat_ = msg.value("BASE_LAT", base_lat_);
+                base_lon_ = msg.value("BASE_LON", base_lon_);
                 status_ = "AVAILABLE";
 
                 std::cout << "[DRONE] Authenticated. Starting timers and waiting for assignment.\n";
+                std::cout << "[DRONE] Home base=" << base_lat_ << "," << base_lon_
+                          << " signal=" << signal_strength_ << "%\n";
 
                 start_keepalive();
                 start_telemetry();
                 start_battery_timer();
+                start_signal_timer();
 
                 send_drone_ready();
             }
@@ -723,10 +862,16 @@ private:
             else if (type == "DRONE_READY_REJECTED")
             {
                 status_ = msg.value("STATUS", "CHARGING");
-                std::cerr << "[DRONE][RTB] AVAILABLE rejected: "
-                          << msg.value("REASON", "UNKNOWN_REASON")
-                          << " | min_battery=" << msg.value("MIN_BATTERY", 80)
-                          << "%" << std::endl;
+                const std::string reason =
+                    msg.value("REASON", "UNKNOWN_REASON");
+
+                std::cerr << "[DRONE] AVAILABLE rejected: " << reason;
+                if (reason == "SIGNAL_BELOW_READY_THRESHOLD")
+                    std::cerr << " | min_signal=" << msg.value("MIN_SIGNAL", 21) << "%";
+                else
+                    std::cerr << " | min_battery=" << msg.value("MIN_BATTERY", 80) << "%";
+                std::cerr << std::endl;
+
                 if (status_ == "CHARGING")
                     start_charging();
             }
@@ -931,26 +1076,19 @@ private:
 
                 charging_active_ = false;
                 status_ = "RETURN_TO_BASE";
-                active_route_id_.clear();
-                route_points_.clear();
-                current_waypoint_ = 0;
-                inspection_points_.clear();
-                current_inspection_point_ = 0;
-                delivery_mode_ = false;
-                reached_exit_point_ = false;
-                package_delivered_ = false;
-                formation_mode_ = false;
-                formation_id_.clear();
-                formation_offset_north_m_ = 0.0;
-                formation_offset_east_m_ = 0.0;
-                mission_id_.clear();
-                mission_type_.clear();
+                clear_active_mission_for_rtb();
 
                 // Demo: dron se odmah vrati na bazne koordinate.
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
                 lat_ = base_lat;
                 lon_ = base_lon;
                 altitude_ = 0;
+
+                if (rtb_reason_ == "SIGNAL_LOSS")
+                {
+                    signal_strength_ = 100;
+                    signal_loss_alarm_sent_ = false;
+                }
 
                 std::cout << "[DRONE] Returning to base because of "
                           << msg.value("REASON", "UNKNOWN_REASON")
@@ -1082,8 +1220,11 @@ private:
 
         try
         {
+            json secured_msg = msg;
+            secured_msg["SEQ"] = ++udp_sequence_;
+
             json envelope =
-                sdpsec::encrypt_udp_envelope(drone_uri_, msg, udp_key_);
+                sdpsec::encrypt_udp_envelope(drone_uri_, secured_msg, udp_key_);
             std::string data = envelope.dump();
 
             boost::system::error_code ec;
@@ -1134,6 +1275,7 @@ private:
                 {
                     std::cerr << "[DRONE] Write error: "
                               << ec.message() << std::endl;
+                    trigger_connection_loss_failsafe(ec.message());
                 }
             });
     }
@@ -1155,6 +1297,7 @@ private:
     boost::asio::steady_timer telemetry_timer_;
     boost::asio::steady_timer battery_timer_;
     boost::asio::steady_timer charging_timer_;
+    boost::asio::steady_timer signal_timer_;
 
     std::deque<std::string> write_queue_;
 
@@ -1175,8 +1318,13 @@ private:
 
     int battery_;
     int battery_tick_seconds_;
+    int signal_strength_;
+    int signal_tick_seconds_;
+    int signal_drop_per_tick_;
     double lat_;
     double lon_;
+    double base_lat_;
+    double base_lon_;
     int altitude_;
     int speed_;
     std::string direction_;
@@ -1196,7 +1344,10 @@ private:
     bool package_delivered_;
     bool mission_finished_sent_;
     bool low_battery_alarm_sent_;
+    bool signal_loss_alarm_sent_;
     bool charging_active_;
+    bool authenticated_;
+    bool connection_loss_failsafe_triggered_;
     std::string rtb_reason_;
 
     bool formation_mode_;
@@ -1204,6 +1355,7 @@ private:
     double formation_offset_north_m_;
     double formation_offset_east_m_;
     GeoPoint formation_target_;
+    std::uint64_t udp_sequence_;
 };
 
 int main(int argc, char* argv[])

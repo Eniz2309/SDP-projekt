@@ -28,11 +28,14 @@ Dronovi komuniciraju iskljucivo sa pripadajucim regionalnim serverom. Direktna k
 - FORMATION sa regionalnim serverom kao virtualnim leaderom
 - prekid cijele formacije ako bilo koji clan prijavi LOW_BATTERY ili izgubi vezu
 - STOP_MISSION, promjena parametara leta i rucni RTB
-- LOW_BATTERY i CONNECTION_LOST alarmi
+- LOW_BATTERY, SIGNAL_LOSS i CONNECTION_LOST alarmi
 - UDP TELEMETRY i KEEPALIVE sa zadatkom, rezimom leta i statusom senzora
 - SQLite evidencija dronova, misija, alarma, zona i inspection izvjestaja
 - TLS 1.3 sa `X25519MLKEM768` i `ML-DSA-44`
 - AES-256-GCM zastita UDP payload-a kljucem izvedenim iz TLS sesije
+- UDP anti-replay zastita monotonim `SEQ` brojem po TLS sesiji
+- lokalni failsafe RTB kada drone client izgubi TCP/TLS vezu sa regionalnim serverom
+- kontinuirani live nadzor odstupanja od planirane rute i stvarne separacije dronova
 
 ## Fajlovi
 
@@ -174,7 +177,13 @@ MISSION_ID
 MISSION_TYPE
 FLIGHT_MODE
 SENSOR_STATUS
+SIGNAL_STRENGTH
+SEQ
 ```
+
+`SIGNAL_STRENGTH` je simulirana jacina radio veze od 0 do 100%. `SEQ` je
+monotono rastuci broj UDP poruke i nalazi se unutar AES-GCM autentificiranog
+payload-a.
 
 `MISSION_ID` i `MISSION_TYPE` opisuju trenutni zadatak. `FLIGHT_MODE` odvaja rezim leta (`GROUND`, `STANDBY`, `AUTONOMOUS`, `FORMATION`, `RTB`) od tipa zadatka, dok je `SENSOR_STATUS` simulirani health status senzorskog podsistema. Regionalni server cuva trenutno stanje i historijski log, a zatim isti status prosljedjuje centralnom serveru.
 
@@ -208,7 +217,7 @@ CIPHER=TLS_AES_256_GCM_SHA384
 PEER_KEY=ML-DSA-44
 ```
 
-UDP TELEMETRY/KEEPALIVE se salju kao AES-256-GCM envelope sa `NONCE`, `TAG` i `CIPHERTEXT` poljima.
+UDP TELEMETRY/KEEPALIVE se salju kao AES-256-GCM envelope sa `NONCE`, `TAG` i `CIPHERTEXT` poljima. Svaki enkriptovani payload sadrzi i monoton `SEQ`. Regionalni server pamti posljednji prihvaceni `SEQ` za aktivnu TLS sesiju i odbacuje svaki datagram sa `SEQ <= last_seq`, cime se sprecava replay vec snimljene validne telemetrije ili keepalive poruke.
 
 ## Detekcija konflikta ruta
 
@@ -273,3 +282,86 @@ Dron se registruje sa 21%, nakon približno 2 s pada na 20%, šalje
 `LOW_BATTERY`, izvršava RTB i ulazi u `CHARGING`. Zatim se u demo režimu puni
 10% svake 2 s do 80%, nakon čega traži `AVAILABLE` od centralnog servera.
 
+
+
+## SIGNAL_LOSS
+
+Pored prekida TCP/TLS veze, protokol modelira i degradaciju radio signala.
+`SIGNAL_STRENGTH` se salje u telemetriji. Normalni default je 100% i signal se
+sam od sebe ne smanjuje. Za demo test moze se ukljuciti simulirani pad:
+
+```bash
+SDP_INITIAL_SIGNAL=25 SDP_SIGNAL_TICK_SECONDS=2 SDP_SIGNAL_DROP_PER_TICK=3 \
+./drone_client 127.0.0.1 8000 8001 DRON_001 abc123 120
+```
+
+Tok je:
+
+```text
+SIGNAL_STRENGTH <= 20%
+        -> SIGNAL_LOSS alarm
+        -> centralni prekida aktivnu misiju
+        -> RETURN_TO_BASE
+        -> AT_BASE
+        -> signal se na bazi simulacijski oporavlja na 100%
+        -> AVAILABLE
+```
+
+Ako je dron clan formacije, `SIGNAL_LOSS` jednog clana prekida cijelu
+formaciju, failed clan dobija RTB, a ostali clanovi `STOP_MISSION`.
+
+## Lokalni failsafe kod prekida veze
+
+Drone client iz `AUTH_ACK` pamti koordinate pripadajuce regionalne baze. Ako
+tokom leta TCP/TLS veza sa regionalnim serverom stvarno pukne, dron ne moze
+cekati server komandu. Lokalni FSM zato odmah izvrsava:
+
+```text
+TCP/TLS DISCONNECT
+      -> CONNECTION_LOST_LOCAL_FAILSAFE
+      -> RETURN_TO_BASE
+      -> AT_BASE_CONNECTION_LOST
+```
+
+U simulatoru je geografski povratak trenutan. Regionalni watchdog nezavisno
+detektuje izostanak telemetrije/keepalive poruka i globalno prijavljuje
+`CONNECTION_LOST` centralnom serveru.
+
+## Live nadzor rute
+
+Planiranje konflikta se radi prije dodjele, ali centralni server dodatno na
+svakoj telemetriji nadzire stvarno izvrsavanje aktivne misije.
+
+Provjeravaju se:
+
+- udaljenost trenutne pozicije od planirane putanje;
+- stvarna horizontalna i vertikalna separacija od drugih aktivnih dronova;
+- clanovi iste formacije se izuzimaju iz medjusobne conflict provjere jer su
+  namjerno koordinisani na istoj visini.
+
+Ako dron izadje iz dozvoljenog koridora, u tabelu `alarms` upisuje se
+`ROUTE_DEVIATION`. Ako dvije nezavisne aktivne letjelice u stvarnom vremenu
+prekrse sigurnu separaciju, upisuje se `LIVE_ROUTE_CONFLICT`.
+
+Provjera:
+
+```sql
+SELECT id, drone_uri, alarm_type, message, created_at
+FROM alarms
+WHERE alarm_type IN ('SIGNAL_LOSS', 'ROUTE_DEVIATION', 'LIVE_ROUTE_CONFLICT')
+ORDER BY id DESC;
+```
+
+## Anti-replay provjera
+
+Normalan regionalni log za UDP izgleda ovako:
+
+```text
+[REGIONAL][UDP][AES-256-GCM] TELEMETRY od DRON_001 | SEQ=15 | ...
+```
+
+Ako se isti validni datagram ponovi, regionalni ga ne prosljedjuje centralnom:
+
+```text
+[REGIONAL][UDP][ANTI-REPLAY] Odbijen DRON_001 SEQ=15 last=15
+```

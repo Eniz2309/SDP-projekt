@@ -1,5 +1,5 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: pqc_tls_utils.h
 // Dodano: bez funkcionalnih promjena; zadrzani TLS 1.3,
 //         X25519MLKEM768, ML-DSA-44 i TLS exporter za UDP kljuc.

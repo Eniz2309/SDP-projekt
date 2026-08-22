@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: regional_server.cpp
-// Dodano: formation failure dispatch; regionalni gasi virtualnog leadera,
-//         salje STOP preostalim clanovima i LOW_BATTERY clanu prosljeduje RTB.
+// Dodano: UDP SEQ anti-replay provjera, SIGNAL_STRENGTH telemetrija,
+//         SIGNAL_LOSS prosljedivanje i base koordinate u AUTH_ACK odgovoru.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -22,6 +22,7 @@
 #include <utility>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 
 #include <sqlite3.h>
 #include "json/json.h"
@@ -66,11 +67,12 @@ struct DroneConnection
 {
     std::shared_ptr<ssl::stream<tcp::socket>> stream;
     std::array<unsigned char, 32> udp_key;
+    std::atomic<std::uint64_t> last_udp_seq;
     std::mutex write_mutex;
 
     DroneConnection(const std::shared_ptr<ssl::stream<tcp::socket>>& s,
                     const std::array<unsigned char, 32>& key)
-        : stream(s), udp_key(key)
+        : stream(s), udp_key(key), last_udp_seq(0)
     {
     }
 };
@@ -495,6 +497,7 @@ void init_database()
             mission_type TEXT DEFAULT '',
             flight_mode TEXT DEFAULT 'UNKNOWN',
             sensor_status TEXT DEFAULT 'UNKNOWN',
+            signal_strength INTEGER DEFAULT 100,
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
@@ -515,6 +518,7 @@ void init_database()
             mission_type TEXT DEFAULT '',
             flight_mode TEXT DEFAULT 'UNKNOWN',
             sensor_status TEXT DEFAULT 'UNKNOWN',
+            signal_strength INTEGER DEFAULT 100,
             received_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
@@ -542,6 +546,7 @@ void init_database()
         add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN mission_type TEXT DEFAULT '';" );
         add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN flight_mode TEXT DEFAULT 'UNKNOWN';" );
         add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN sensor_status TEXT DEFAULT 'UNKNOWN';" );
+        add_column_if_missing("ALTER TABLE " + table + " ADD COLUMN signal_strength INTEGER DEFAULT 100;" );
     }
 
     exec_sql(R"(
@@ -589,6 +594,7 @@ void save_drone_status(const json& msg)
     std::string mission_type = msg.value("MISSION_TYPE", "");
     std::string flight_mode = msg.value("FLIGHT_MODE", "UNKNOWN");
     std::string sensor_status = msg.value("SENSOR_STATUS", "UNKNOWN");
+    int signal_strength = msg.value("SIGNAL_STRENGTH", 100);
 
     mark_drone_seen(msg);
 
@@ -597,28 +603,29 @@ void save_drone_status(const json& msg)
     auto upsert_stmt = g_db->prepare(R"(
         INSERT OR REPLACE INTO drones
         (drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
-         route_id, mission_id, mission_type, flight_mode, sensor_status, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+         route_id, mission_id, mission_type, flight_mode, sensor_status, signal_strength, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
     )");
 
     upsert_stmt.execute(drone_uri, REGION_ID, battery, status, lat, lon, altitude, speed, direction,
-                        route_id, mission_id, mission_type, flight_mode, sensor_status);
+                        route_id, mission_id, mission_type, flight_mode, sensor_status, signal_strength);
 
     auto log_stmt = g_db->prepare(R"(
         INSERT INTO keepalive_log
         (drone_uri, battery, status, lat, lon, altitude, speed, direction, route_id,
-         mission_id, mission_type, flight_mode, sensor_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+         mission_id, mission_type, flight_mode, sensor_status, signal_strength)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     )");
 
     log_stmt.execute(drone_uri, battery, status, lat, lon, altitude, speed, direction, route_id,
-                     mission_id, mission_type, flight_mode, sensor_status);
+                     mission_id, mission_type, flight_mode, sensor_status, signal_strength);
 
     std::cout << "[REGIONAL] Status drona: " << drone_uri
               << " | " << status
               << " | mission=" << (mission_id.empty() ? "NONE" : mission_id)
               << " | mode=" << flight_mode
               << " | sensor=" << sensor_status
+              << " | signal=" << signal_strength << "%"
               << " | battery=" << battery << "%"
               << " | route=" << route_id << std::endl;
 }
@@ -650,6 +657,7 @@ void copy_telemetry_context(json& dst, const json& src)
     dst["MISSION_TYPE"] = src.value("MISSION_TYPE", "");
     dst["FLIGHT_MODE"] = src.value("FLIGHT_MODE", "UNKNOWN");
     dst["SENSOR_STATUS"] = src.value("SENSOR_STATUS", "UNKNOWN");
+    dst["SIGNAL_STRENGTH"] = src.value("SIGNAL_STRENGTH", 100);
 }
 
 json send_to_central(json msg);
@@ -906,6 +914,8 @@ json handle_drone_message(json msg)
                 response["TYPE"] = "AUTH_ACK";
                 response["DRONE_URI"] = drone_uri;
                 response["MESSAGE"] = "Authentication successful";
+                response["BASE_LAT"] = BASE_LAT;
+                response["BASE_LON"] = BASE_LON;
             }
             else
             {
@@ -1400,6 +1410,19 @@ void start_udp_server(unsigned short port)
                     continue;
                 }
 
+                const std::uint64_t seq =
+                    msg.value("SEQ", static_cast<std::uint64_t>(0));
+                const std::uint64_t last_seq = connection->last_udp_seq.load();
+
+                if (seq == 0 || seq <= last_seq)
+                {
+                    std::cerr << "[REGIONAL][UDP][ANTI-REPLAY] Odbijen "
+                              << drone_uri << " SEQ=" << seq
+                              << " last=" << last_seq << std::endl;
+                    continue;
+                }
+                connection->last_udp_seq.store(seq);
+
                 std::string original_type = msg.value("TYPE", "UNKNOWN");
 
                 if (original_type != "KEEPALIVE" && original_type != "TELEMETRY")
@@ -1411,6 +1434,7 @@ void start_udp_server(unsigned short port)
 
                 std::cout << "[REGIONAL][UDP][AES-256-GCM] " << original_type
                           << " od " << drone_uri
+                          << " | SEQ=" << seq
                           << " | " << sender_endpoint.address().to_string()
                           << ":" << sender_endpoint.port() << std::endl;
 

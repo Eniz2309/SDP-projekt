@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: mission_client.cpp
-// Dodano: bez promjene CLI sintakse; FORMATION zahtjevi ostaju kompatibilni
-//         sa serverskim prekidom formacije pri kvaru bilo kojeg clana.
+// Dodano: bez promjene CLI sintakse; kontrola misija ostaje kompatibilna
+//         sa SIGNAL_LOSS, live route nadzorom i ostalim serverskim zastitama.
 // ============================================================
 
 #include <boost/asio.hpp>

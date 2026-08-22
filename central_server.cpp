@@ -1,9 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: central_server.cpp
-// Dodano: formation failure handling za LOW_BATTERY i CONNECTION_LOST;
-//         kvar bilo kojeg clana prekida cijelu formaciju, zaustavlja
-//         preostale clanove i pravilno oslobada resurse/scheduler.
+// Dodano: SIGNAL_LOSS obrada, SIGNAL_STRENGTH registar, live route/deviation
+//         nadzor i dinamicka provjera separacije aktivnih dronova.
 // ============================================================
 
 #include <boost/asio.hpp>
@@ -20,6 +19,7 @@
 #include <sstream>
 #include <iomanip>
 #include <limits>
+#include <unordered_set>
 #include <openssl/evp.h>
 
 #include <sqlite3.h>
@@ -35,6 +35,8 @@ namespace sqlite = sqlite3_wrapper;
 std::unique_ptr<sqlite::db> g_db;
 std::mutex db_mutex;
 std::mutex scheduler_mutex;
+std::mutex route_monitor_mutex;
+std::unordered_set<std::string> route_monitor_alerts;
 
 const int DEFAULT_MAX_DRONES_PER_ROUTE = 3;
 const int DEFAULT_VERTICAL_SEPARATION_M = 2;
@@ -45,6 +47,8 @@ const double DEFAULT_HORIZONTAL_ROUTE_SAFETY_M = 20.0;
 const int MIN_FLIGHT_ALTITUDE_M = 20;
 const int MAX_FLIGHT_ALTITUDE_M = 500;
 const int MIN_READY_BATTERY_PERCENT = 80;
+const int MIN_READY_SIGNAL_PERCENT = 21;
+const double LIVE_ROUTE_CORRIDOR_M = 35.0;
 
 struct LocalPoint
 {
@@ -246,6 +250,7 @@ void init_database()
             mission_type TEXT DEFAULT '',
             flight_mode TEXT DEFAULT 'UNKNOWN',
             sensor_status TEXT DEFAULT 'UNKNOWN',
+            signal_strength INTEGER DEFAULT 100,
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     )");
@@ -272,6 +277,7 @@ void init_database()
     add_column_if_missing("ALTER TABLE drones ADD COLUMN mission_type TEXT DEFAULT '';");
     add_column_if_missing("ALTER TABLE drones ADD COLUMN flight_mode TEXT DEFAULT 'UNKNOWN';");
     add_column_if_missing("ALTER TABLE drones ADD COLUMN sensor_status TEXT DEFAULT 'UNKNOWN';");
+    add_column_if_missing("ALTER TABLE drones ADD COLUMN signal_strength INTEGER DEFAULT 100;");
 
     exec_sql(R"(
         CREATE TABLE IF NOT EXISTS drone_credentials (
@@ -799,6 +805,16 @@ RoutePathGeometry build_route_path_geometry(const std::string& mission_id,
     const bool close_loop = (mission_type != "INSPECTION");
     result.points = make_square_route_points(zone_info, route, close_loop);
 
+    if (start_lat != 0.0 || start_lon != 0.0)
+    {
+        if (result.points.empty() ||
+            std::abs(result.points.front().lat - start_lat) > 1e-10 ||
+            std::abs(result.points.front().lon - start_lon) > 1e-10)
+        {
+            result.points.insert(result.points.begin(), GeoPoint{start_lat, start_lon});
+        }
+    }
+
     if (mission_type == "FORMATION")
         result.extra_horizontal_buffer_m = formation_horizontal_buffer_m(mission_id);
 
@@ -839,7 +855,8 @@ RouteConflictInfo find_route_conflict(const std::string& candidate_mission_id,
               AND mission_id <> ?
               AND status IN ('ACTIVE', 'STOP_REQUESTED',
                              'ABORTING_FORMATION_LOW_BATTERY',
-                             'ABORTING_FORMATION_CONNECTION_LOST');
+                             'ABORTING_FORMATION_CONNECTION_LOST',
+                             'ABORTING_FORMATION_SIGNAL_LOSS');
         )");
         q.execute(region_id, candidate_mission_id);
         std::string id;
@@ -950,7 +967,8 @@ bool assign_altitude_slot(const std::string& mission_id,
             FROM missions
             WHERE status IN ('ACTIVE', 'STOP_REQUESTED',
                              'ABORTING_FORMATION_LOW_BATTERY',
-                             'ABORTING_FORMATION_CONNECTION_LOST')
+                             'ABORTING_FORMATION_CONNECTION_LOST',
+                             'ABORTING_FORMATION_SIGNAL_LOSS')
               AND region_id = ?
               AND zone = ?
               AND route_id = ?;
@@ -1287,6 +1305,199 @@ void handle_region_register(const json& msg)
               << " | broj zona: " << zones.size() << std::endl;
 }
 
+
+double point_to_path_distance_m(double lat, double lon,
+                                const RoutePathGeometry& path,
+                                double reference_lat,
+                                double reference_lon)
+{
+    if (!path.valid || path.points.size() < 2)
+        return std::numeric_limits<double>::infinity();
+
+    const LocalPoint p =
+        latlon_to_offset(reference_lat, reference_lon, lat, lon);
+    double minimum = std::numeric_limits<double>::infinity();
+
+    for (std::size_t i = 1; i < path.points.size(); ++i)
+    {
+        const LocalPoint a = latlon_to_offset(
+            reference_lat, reference_lon,
+            path.points[i - 1].lat, path.points[i - 1].lon);
+        const LocalPoint b = latlon_to_offset(
+            reference_lat, reference_lon,
+            path.points[i].lat, path.points[i].lon);
+
+        minimum = std::min(minimum, point_to_segment_distance(p, a, b));
+    }
+    return minimum;
+}
+
+void save_monitor_alarm_once(const std::string& key,
+                             const std::string& drone_uri,
+                             const std::string& alarm_type,
+                             const std::string& message)
+{
+    {
+        std::lock_guard<std::mutex> lock(route_monitor_mutex);
+        if (route_monitor_alerts.find(key) != route_monitor_alerts.end())
+            return;
+        route_monitor_alerts.insert(key);
+    }
+
+    std::lock_guard<std::mutex> lock(db_mutex);
+    auto stmt = g_db->prepare(R"(
+        INSERT INTO alarms(drone_uri, alarm_type, message)
+        VALUES (?, ?, ?);
+    )");
+    stmt.execute(drone_uri, alarm_type, message);
+
+    std::cout << "[CENTRAL][ROUTE][LIVE] " << alarm_type
+              << " | " << message << std::endl;
+}
+
+void monitor_live_route(const json& msg)
+{
+    const std::string drone_uri = msg.value("DRONE_URI", "");
+    const std::string region_id = msg.value("REGION_ID", "");
+    const std::string mission_id = msg.value("MISSION_ID", "");
+    const std::string status = msg.value("STATUS", "");
+    const double lat = msg.value("LAT", 0.0);
+    const double lon = msg.value("LON", 0.0);
+    const int altitude = msg.value("ALTITUDE", 0);
+
+    if (drone_uri.empty() || region_id.empty() || mission_id.empty())
+        return;
+
+    if (status != "ON_MISSION" && status != "DELIVERY_APPROACH" &&
+        status != "DELIVERING" && status != "FORMATION")
+        return;
+
+    std::string mission_status, mission_type, zone, route_id;
+    double start_lat = 0.0, start_lon = 0.0;
+    double delivery_lat = 0.0, delivery_lon = 0.0;
+    double exit_lat = 0.0, exit_lon = 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT status FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id);
+        if (!q.fetch(mission_status) || mission_status != "ACTIVE")
+            return;
+
+        q = g_db->prepare("SELECT mission_type FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(mission_type);
+        q = g_db->prepare("SELECT zone FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(zone);
+        q = g_db->prepare("SELECT route_id FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(route_id);
+        q = g_db->prepare("SELECT start_lat FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(start_lat);
+        q = g_db->prepare("SELECT start_lon FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(start_lon);
+        q = g_db->prepare("SELECT delivery_lat FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(delivery_lat);
+        q = g_db->prepare("SELECT delivery_lon FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(delivery_lon);
+        q = g_db->prepare("SELECT exit_lat FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(exit_lat);
+        q = g_db->prepare("SELECT exit_lon FROM missions WHERE mission_id = ?;");
+        q.execute(mission_id); q.fetch(exit_lon);
+    }
+
+    RoutePathGeometry path = build_route_path_geometry(
+        mission_id, region_id, mission_type, zone, route_id,
+        start_lat, start_lon, delivery_lat, delivery_lon, exit_lat, exit_lon);
+
+    ZoneInfo zone_info = get_zone_info(region_id, zone);
+    if (path.valid && zone_info.found)
+    {
+        const double distance = point_to_path_distance_m(
+            lat, lon, path, zone_info.center_lat, zone_info.center_lon);
+        const double allowed = LIVE_ROUTE_CORRIDOR_M +
+                               path.extra_horizontal_buffer_m;
+
+        if (distance > allowed)
+        {
+            std::ostringstream text;
+            text << "Drone " << drone_uri
+                 << " mission=" << mission_id
+                 << " is " << std::fixed << std::setprecision(1)
+                 << distance << "m from planned route corridor (allowed "
+                 << allowed << "m)";
+
+            save_monitor_alarm_once(
+                "DEV:" + mission_id + ":" + drone_uri,
+                drone_uri, "ROUTE_DEVIATION", text.str());
+        }
+    }
+
+    std::vector<std::string> others;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare(R"(
+            SELECT drone_uri
+            FROM drones
+            WHERE region_id = ?
+              AND drone_uri <> ?
+              AND mission_id <> ''
+              AND status IN ('ON_MISSION', 'DELIVERY_APPROACH',
+                             'DELIVERING', 'FORMATION', 'BUSY');
+        )");
+        q.execute(region_id, drone_uri);
+        std::string other;
+        while (q.fetch(other))
+            others.push_back(other);
+    }
+
+    for (const auto& other : others)
+    {
+        double other_lat = 0.0, other_lon = 0.0;
+        int other_altitude = 0;
+        std::string other_mission, other_type;
+
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+            auto q = g_db->prepare("SELECT lat FROM drones WHERE drone_uri = ?;");
+            q.execute(other); if (!q.fetch(other_lat)) continue;
+            q = g_db->prepare("SELECT lon FROM drones WHERE drone_uri = ?;");
+            q.execute(other); q.fetch(other_lon);
+            q = g_db->prepare("SELECT altitude FROM drones WHERE drone_uri = ?;");
+            q.execute(other); q.fetch(other_altitude);
+            q = g_db->prepare("SELECT mission_id FROM drones WHERE drone_uri = ?;");
+            q.execute(other); q.fetch(other_mission);
+            q = g_db->prepare("SELECT mission_type FROM drones WHERE drone_uri = ?;");
+            q.execute(other); q.fetch(other_type);
+        }
+
+        if (mission_type == "FORMATION" && other_type == "FORMATION" &&
+            other_mission == mission_id)
+            continue;
+
+        const LocalPoint relative =
+            latlon_to_offset(lat, lon, other_lat, other_lon);
+        const double horizontal = std::sqrt(
+            relative.north_m * relative.north_m +
+            relative.east_m * relative.east_m);
+        const int vertical = std::abs(altitude - other_altitude);
+
+        if (horizontal < DEFAULT_HORIZONTAL_ROUTE_SAFETY_M &&
+            vertical < DEFAULT_VERTICAL_SEPARATION_M)
+        {
+            const std::string first = std::min(drone_uri, other);
+            const std::string second = std::max(drone_uri, other);
+            std::ostringstream text;
+            text << "Unsafe live separation " << first << " <-> " << second
+                 << ": horizontal=" << std::fixed << std::setprecision(1)
+                 << horizontal << "m vertical=" << vertical << "m";
+
+            save_monitor_alarm_once(
+                "SEP:" + first + ":" + mission_id + ":" +
+                second + ":" + other_mission,
+                drone_uri, "LIVE_ROUTE_CONFLICT", text.str());
+        }
+    }
+}
+
 void handle_drone_status(const json& msg)
 {
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
@@ -1303,31 +1514,33 @@ void handle_drone_status(const json& msg)
     std::string mission_type = msg.value("MISSION_TYPE", "");
     std::string flight_mode = msg.value("FLIGHT_MODE", "UNKNOWN");
     std::string sensor_status = msg.value("SENSOR_STATUS", "UNKNOWN");
+    int signal_strength = msg.value("SIGNAL_STRENGTH", 100);
 
-    std::lock_guard<std::mutex> lock(db_mutex);
-
-    auto stmt = g_db->prepare(R"(
-        INSERT OR REPLACE INTO drones
-        (drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
-         route_id, mission_id, mission_type, flight_mode, sensor_status, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
-    )");
-
-    stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
-                 route_id, mission_id, mission_type, flight_mode, sensor_status);
-
-    // Ako operator promijeni visinu tokom aktivne misije, ACK/telemetrija
-    // osvjezava i planerski zapis. Tako naredna provjera konflikta ne koristi
-    // zastarjelu visinu iz trenutka prvobitne dodjele.
-    if (!mission_id.empty())
     {
-        auto mission_stmt = g_db->prepare(R"(
-            UPDATE missions
-            SET altitude = ?
-            WHERE mission_id = ?
-              AND status IN ('ACTIVE', 'STOP_REQUESTED');
+        std::lock_guard<std::mutex> lock(db_mutex);
+
+        auto stmt = g_db->prepare(R"(
+            INSERT OR REPLACE INTO drones
+            (drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
+             route_id, mission_id, mission_type, flight_mode, sensor_status,
+             signal_strength, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
         )");
-        mission_stmt.execute(altitude, mission_id);
+
+        stmt.execute(drone_uri, region_id, battery, status, lat, lon, altitude, speed, direction,
+                     route_id, mission_id, mission_type, flight_mode, sensor_status,
+                     signal_strength);
+
+        if (!mission_id.empty())
+        {
+            auto mission_stmt = g_db->prepare(R"(
+                UPDATE missions
+                SET altitude = ?
+                WHERE mission_id = ?
+                  AND status IN ('ACTIVE', 'STOP_REQUESTED');
+            )");
+            mission_stmt.execute(altitude, mission_id);
+        }
     }
 
     std::cout << "[CENTRAL] Status drona: " << drone_uri
@@ -1335,7 +1548,10 @@ void handle_drone_status(const json& msg)
               << " | mission=" << (mission_id.empty() ? "NONE" : mission_id)
               << " | mode=" << flight_mode
               << " | sensor=" << sensor_status
+              << " | signal=" << signal_strength << "%"
               << " | battery=" << battery << "%" << std::endl;
+
+    monitor_live_route(msg);
 }
 
 
@@ -1367,20 +1583,26 @@ json abort_formation_on_member_failure(const std::string& mission_id,
     double base_lon = 0.0;
 
     const bool low_battery = (failure_type == "LOW_BATTERY");
+    const bool signal_loss = (failure_type == "SIGNAL_LOSS");
+    const bool requires_rtb = low_battery || signal_loss;
+
     const std::string aborting_status = low_battery
         ? "ABORTING_FORMATION_LOW_BATTERY"
-        : "ABORTING_FORMATION_CONNECTION_LOST";
+        : (signal_loss ? "ABORTING_FORMATION_SIGNAL_LOSS"
+                       : "ABORTING_FORMATION_CONNECTION_LOST");
     const std::string final_status = low_battery
         ? "ABORTED_FORMATION_LOW_BATTERY"
-        : "ABORTED_FORMATION_CONNECTION_LOST";
+        : (signal_loss ? "ABORTED_FORMATION_SIGNAL_LOSS"
+                       : "ABORTED_FORMATION_CONNECTION_LOST");
     const std::string failed_member_status = low_battery
         ? "FAILED_LOW_BATTERY"
-        : "FAILED_CONNECTION_LOST";
+        : (signal_loss ? "FAILED_SIGNAL_LOSS"
+                       : "FAILED_CONNECTION_LOST");
 
     {
         std::lock_guard<std::mutex> lock(db_mutex);
 
-        if (low_battery)
+        if (requires_rtb)
         {
             auto q = g_db->prepare("SELECT base_lat FROM regional_servers WHERE region_id = ?;");
             q.execute(region_id);
@@ -1423,7 +1645,7 @@ json abort_formation_on_member_failure(const std::string& mission_id,
         other_members_stmt.execute(mission_id, failed_drone);
 
         // Neispravni clan odmah izlazi iz aktivne mission/route evidencije.
-        if (low_battery)
+        if (requires_rtb)
         {
             auto drone_stmt = g_db->prepare(R"(
                 UPDATE drones
@@ -1479,15 +1701,16 @@ json abort_formation_on_member_failure(const std::string& mission_id,
     response["FINAL_MISSION_STATUS"] = final_status;
     response["COMMANDS"] = commands;
 
-    // LOW_BATTERY clan jos ima vezu, pa regionalni ovu komandu vraca bas njemu.
-    if (low_battery)
+    // LOW_BATTERY i SIGNAL_LOSS clan jos imaju signalizacionu sesiju,
+    // pa regionalni RETURN_TO_BASE komandu vraca bas tom clanu.
+    if (requires_rtb)
     {
         json failed_command;
         failed_command["TYPE"] = "RETURN_TO_BASE";
         failed_command["DRONE_URI"] = failed_drone;
         failed_command["BASE_LAT"] = base_lat;
         failed_command["BASE_LON"] = base_lon;
-        failed_command["REASON"] = "LOW_BATTERY";
+        failed_command["REASON"] = failure_type;
         failed_command["FORMATION_ABORTED"] = true;
         failed_command["MISSION_ID"] = mission_id;
         response["FAILED_DRONE_COMMAND"] = failed_command;
@@ -1531,7 +1754,8 @@ json handle_alarm(const json& msg)
 
     // Formation se tretira kao jedna koordinisana misija. Kvar bilo kojeg clana
     // prekida cijelu formaciju, neovisno o tome koji clan je upisan u missions.drone_uri.
-    if (alarm_type == "LOW_BATTERY" || alarm_type == "CONNECTION_LOST")
+    if (alarm_type == "LOW_BATTERY" || alarm_type == "CONNECTION_LOST" ||
+        alarm_type == "SIGNAL_LOSS")
     {
         std::string formation_mission_id;
         if (find_active_formation_for_drone(drone_uri, formation_mission_id))
@@ -1569,6 +1793,60 @@ json handle_alarm(const json& msg)
                   << " oznacen kao CONNECTION_LOST; aktivna misija je prekinuta."
                   << std::endl;
 
+        return response;
+    }
+
+    if (alarm_type == "SIGNAL_LOSS")
+    {
+        double base_lat = 0.0;
+        double base_lon = 0.0;
+
+        {
+            std::lock_guard<std::mutex> lock(db_mutex);
+
+            auto q = g_db->prepare(
+                "SELECT base_lat FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id);
+            if (!q.fetch(base_lat))
+            {
+                response["TYPE"] = "ERROR";
+                response["MESSAGE"] = "BASE_NOT_FOUND_FOR_REGION";
+                return response;
+            }
+
+            q = g_db->prepare(
+                "SELECT base_lon FROM regional_servers WHERE region_id = ?;");
+            q.execute(region_id);
+            q.fetch(base_lon);
+
+            auto mission_stmt = g_db->prepare(R"(
+                UPDATE missions
+                SET status = 'ABORTED_SIGNAL_LOSS',
+                    finished_at = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?
+                  AND status = 'ACTIVE';
+            )");
+            mission_stmt.execute(drone_uri);
+
+            auto drone_stmt = g_db->prepare(R"(
+                UPDATE drones
+                SET status = 'RETURN_TO_BASE',
+                    route_id = '', mission_id = '', mission_type = '',
+                    flight_mode = 'RTB', last_seen = CURRENT_TIMESTAMP
+                WHERE drone_uri = ?;
+            )");
+            drone_stmt.execute(drone_uri);
+        }
+
+        response["TYPE"] = "RETURN_TO_BASE";
+        response["DRONE_URI"] = drone_uri;
+        response["BASE_LAT"] = base_lat;
+        response["BASE_LON"] = base_lon;
+        response["REASON"] = "SIGNAL_LOSS";
+
+        std::cout << "[CENTRAL] SIGNAL_LOSS -> RETURN_TO_BASE za "
+                  << drone_uri << " prema bazi "
+                  << base_lat << ", " << base_lon << std::endl;
         return response;
     }
 
@@ -1711,13 +1989,15 @@ json handle_ack_stop(const json& msg)
                         WHEN 'STOP_REQUESTED' THEN 'STOPPED'
                         WHEN 'ABORTING_FORMATION_LOW_BATTERY' THEN 'ABORTED_FORMATION_LOW_BATTERY'
                         WHEN 'ABORTING_FORMATION_CONNECTION_LOST' THEN 'ABORTED_FORMATION_CONNECTION_LOST'
+                        WHEN 'ABORTING_FORMATION_SIGNAL_LOSS' THEN 'ABORTED_FORMATION_SIGNAL_LOSS'
                         ELSE status
                     END,
                     finished_at = CURRENT_TIMESTAMP
                     WHERE mission_id = ?
                       AND status IN ('STOP_REQUESTED',
                                      'ABORTING_FORMATION_LOW_BATTERY',
-                                     'ABORTING_FORMATION_CONNECTION_LOST');
+                                     'ABORTING_FORMATION_CONNECTION_LOST',
+                                     'ABORTING_FORMATION_SIGNAL_LOSS');
                 )");
                 mission_stmt.execute(mission_id);
             }
@@ -1966,6 +2246,7 @@ bool get_available_drone(const std::string& region_id, std::string& drone_uri)
         WHERE region_id = ?
           AND status = 'AVAILABLE'
           AND battery > 20
+          AND signal_strength > 20
         ORDER BY last_seen ASC
         LIMIT 1;
     )");
@@ -1984,6 +2265,7 @@ std::vector<std::string> get_available_drones(const std::string& region_id, int 
         WHERE region_id = ?
           AND status = 'AVAILABLE'
           AND battery > 20
+          AND signal_strength > 20
         ORDER BY last_seen ASC;
     )");
     stmt.execute(region_id);
@@ -2240,6 +2522,18 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
     if (static_cast<int>(members.size()) < formation_size)
         return false;
 
+    double formation_start_lat = 0.0;
+    double formation_start_lon = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(db_mutex);
+        auto q = g_db->prepare("SELECT lat FROM drones WHERE drone_uri = ?;");
+        q.execute(members.front());
+        q.fetch(formation_start_lat);
+        q = g_db->prepare("SELECT lon FROM drones WHERE drone_uri = ?;");
+        q.execute(members.front());
+        q.fetch(formation_start_lon);
+    }
+
     ZoneInfo zone_info = get_zone_info(region_id, zone);
     if (!zone_info.found)
         return false;
@@ -2257,7 +2551,7 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
     int formation_slot = -1;
     std::string route_failure_reason;
     if (!assign_altitude_slot(mission_id, region_id, "FORMATION", zone, route_id, route,
-                              requested_altitude, 0.0, 0.0,
+                              requested_altitude, formation_start_lat, formation_start_lon,
                               0.0, 0.0, 0.0, 0.0,
                               formation_altitude, formation_slot, route_failure_reason))
     {
@@ -2274,12 +2568,14 @@ bool build_formation_assignment(const std::string& mission_id, json& commands)
         auto mission_stmt = g_db->prepare(R"(
             UPDATE missions
             SET drone_uri = ?, route_id = ?, altitude = ?, altitude_slot = ?,
+                start_lat = ?, start_lon = ?,
                 queue_reason = '', status = 'ACTIVE'
             WHERE mission_id = ? AND status = 'QUEUED';
         )");
         // drone_uri je samo reprezentativni clan radi kompatibilnosti sa starijom semom.
         mission_stmt.execute(members.front(), route_id, formation_altitude,
-                             formation_slot, mission_id);
+                             formation_slot, formation_start_lat, formation_start_lon,
+                             mission_id);
 
         auto del = g_db->prepare("DELETE FROM formation_members WHERE mission_id = ?;");
         del.execute(mission_id);
@@ -2412,6 +2708,7 @@ json handle_drone_ready(const json& msg)
     std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
     std::string region_id = msg.value("REGION_ID", "UNKNOWN_REGION");
     int battery = msg.value("BATTERY", -1);
+    int signal_strength = msg.value("SIGNAL_STRENGTH", 100);
 
     std::string current_status;
     {
@@ -2453,15 +2750,30 @@ json handle_drone_ready(const json& msg)
         return response;
     }
 
+    if (signal_strength < MIN_READY_SIGNAL_PERCENT)
+    {
+        response["TYPE"] = "DRONE_READY_REJECTED";
+        response["DRONE_URI"] = drone_uri;
+        response["STATUS"] = "AT_BASE";
+        response["REASON"] = "SIGNAL_BELOW_READY_THRESHOLD";
+        response["MIN_SIGNAL"] = MIN_READY_SIGNAL_PERCENT;
+
+        std::cout << "[CENTRAL][SIGNAL] DRONE_READY odbijen za " << drone_uri
+                  << " | signal=" << signal_strength << "% | potrebno >= "
+                  << MIN_READY_SIGNAL_PERCENT << "%" << std::endl;
+        return response;
+    }
+
     {
         std::lock_guard<std::mutex> lock(db_mutex);
         auto stmt = g_db->prepare(R"(
             UPDATE drones
             SET status = 'AVAILABLE', route_id = '', mission_id = '', mission_type = '',
-                flight_mode = 'STANDBY', battery = ?, last_seen = CURRENT_TIMESTAMP
+                flight_mode = 'STANDBY', battery = ?, signal_strength = ?,
+                last_seen = CURRENT_TIMESTAMP
             WHERE drone_uri = ?;
         )");
-        stmt.execute(battery, drone_uri);
+        stmt.execute(battery, signal_strength, drone_uri);
     }
 
     response["TYPE"] = "ACK_DRONE_READY";

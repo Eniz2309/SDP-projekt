@@ -1,8 +1,8 @@
 // ============================================================
-// AUTONOMNI DRONOVI - VERZIJA 17
+// AUTONOMNI DRONOVI - VERZIJA 18
 // Fajl: udp_aead.h
-// Dodano: bez funkcionalnih promjena; zadrzana AES-256-GCM
-//         zastita UDP TELEMETRY/KEEPALIVE payload-a.
+// Dodano: AES-256-GCM format ostaje isti; anti-replay SEQ se nalazi
+//         unutar autentificiranog/enkriptovanog JSON payload-a.
 // ============================================================
 
 #ifndef SDP_UDP_AEAD_H
