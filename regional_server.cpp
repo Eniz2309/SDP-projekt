@@ -1,14 +1,9 @@
-// regional_server.cpp
-// v9_scheduler: regionalni server posreduje izmedju centralnog servera, dronova i testnog mission clienta.
-// v10_formation: regionalni server je FORMATION_CONTROLLER / VIRTUAL_LEADER.
-// v11_control_commands: prosljedjuje operatorove PARAMS i MANUAL RTB komande tacno odabranom dronu.
-// Periodicki salje FORMATION_UPDATE svim clanovima; svi clanovi ostaju na istoj visini.
-// Dronovi se registruju kao AVAILABLE; centralni server dodjeljuje START_MISSION slobodnim dronovima.
-// Prioritet ne prekida aktivnu misiju. STOP_MISSION se koristi samo kao posebna kontrolna komanda.
-// Watchdog, UDP telemetrija/keepalive, INSPECTION i RTB ostaju podrzani.
-// v12_pqc_tls: svi TCP kanali koriste TLS 1.3 + X25519MLKEM768 + ML-DSA-44.
-// UDP TELEMETRY/KEEPALIVE koristi AES-256-GCM sa ključem izvedenim iz PQC TLS sesije.
-// v13_auth: REGISTER i AUTH se provjeravaju na centralnom credential registru.
+// ============================================================
+// AUTONOMNI DRONOVI - VERZIJA 13
+// Fajl: regional_server.cpp
+// Dodano: REGISTER/AUTH zahtjevi se provjeravaju preko centralnog
+//         servera; TLS sesija dobija autentifikovani DRONE_URI.
+// ============================================================
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>

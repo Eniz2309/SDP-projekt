@@ -1,13 +1,9 @@
-// drone_client.cpp
-// v9_scheduler: dron vise ne bira vlastitu misiju.
-// v10_formation: FORMATION nema drone-leadera; regionalni server je VIRTUAL_LEADER.
-// v11_control_commands: CHANGE_PARAMS i rucni RETURN_TO_BASE dolaze kroz regionalni server.
-// Svi clanovi formacije lete na istoj visini i dobijaju horizontalne targete od servera.
-// Nakon registracije/autentifikacije prijavljuje DRONE_READY/AVAILABLE i ceka START_MISSION od servera.
-// TCP: kontrolne poruke; UDP: TELEMETRY i KEEPALIVE.
-// v12_pqc_tls: TCP je TLS1.3/X25519MLKEM768/ML-DSA-44; UDP payload je AES-256-GCM.
-// v13_auth: URI+TOKEN mora biti unaprijed provisioniran na centralnom serveru.
-// Podrzani scenariji: TEST_FLIGHT, MONITORING, DELIVERY, INSPECTION, FORMATION, RTB i STOP_MISSION.
+// ============================================================
+// AUTONOMNI DRONOVI - VERZIJA 13
+// Fajl: drone_client.cpp
+// Dodano: URI+TOKEN registracija i autentifikacija moraju biti
+//         potvrdene prije AVAILABLE stanja i slanja telemetrije.
+// ============================================================
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -781,7 +777,7 @@ private:
                 formation_offset_north_m_ = 0.0;
                 formation_offset_east_m_ = 0.0;
 
-                // Demo verzija: dron se odmah vrati na bazne koordinate.
+                // Demo: dron se odmah vrati na bazne koordinate.
                 // Kasnije se može napraviti postepeni povratak pomoću move_towards().
                 lat_ = base_lat;
                 lon_ = base_lon;

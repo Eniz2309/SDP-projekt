@@ -1,3 +1,10 @@
+// ============================================================
+// AUTONOMNI DRONOVI - VERZIJA 13
+// Fajl: pqc_tls_utils.h
+// Sigurnost: TLS 1.3, X25519MLKEM768, ML-DSA-44 i TLS exporter
+//            za izvedeni AES-256-GCM UDP sesijski kljuc.
+// ============================================================
+
 #ifndef SDP_PQC_TLS_UTILS_H
 #define SDP_PQC_TLS_UTILS_H
 

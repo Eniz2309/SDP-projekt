@@ -1,25 +1,9 @@
-// v6_watchdog: obrada CONNECTION_LOST alarma i prekid aktivne misije.
-// v7_inspection: centralni server sa podrskom za INSPECTION tacke i INSPECTION_REPORT poruke.
-// v9_scheduler: prioriteti se primjenjuju na RED CEKANJA ZADATAKA i raspolozivost dronova.
-// v10_formation: formacijski let koristi REGIONALNI SERVER kao VIRTUAL_LEADER/FORMATION_CONTROLLER.
-// v11_control_commands: operator moze poslati CHANGE_PARAMS i rucni RETURN_TO_BASE preko servera.
-// Svi clanovi formacije koriste isti visinski nivo, a razdvojeni su horizontalnim offsetima.
-// Dronovi se registruju kao AVAILABLE, centralni server dodjeljuje zadatke slobodnim dronovima.
-// Nema automatskog preemptiona zbog prioriteta; STOP_MISSION ostaje posebna kontrolna komanda.
-// central_server.cpp
-// v5_tcp_udp: centralni server ostaje TCP; kompatibilan je sa regionalnim v5 koji prima UDP telemetriju od dronova.
-// v13_auth: prava URI+TOKEN autentifikacija preko centralnog credential registra.
-// Centralni server za autonomne dronove.
-// Funkcionalnosti:
-// - registracija regionalnih servera sa bazom i zonama
-// - generisanje pravougaonih/kockastih kontura kao ruta
-// - DELIVERY: izbor najbliže konture i izlazne tačke prema dostavnoj tački
-// - maksimalno 3 drona po istoj ruti, visinski slotovi po 2m
-// - čuvanje statusa dronova, misija i alarma u SQLite bazi
-// - LOW_BATTERY alarm automatski generiše RETURN_TO_BASE komandu
-// - prioritetni red zadataka (MONITORING > DELIVERY > INSPECTION > TEST_FLIGHT)
-// - dodjela zadataka slobodnim dronovima; rute i kapacitet su odvojena logika
-// - FORMATION: 2-5 slobodnih dronova, isti altitude, horizontalni razmak, server kao virtual leader
+// ============================================================
+// AUTONOMNI DRONOVI - VERZIJA 13
+// Fajl: central_server.cpp
+// Dodano: centralni credential registar, SHA-256 provjera tokena,
+//         vezivanje drona za region i centralna REGISTER/AUTH provjera.
+// ============================================================
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>

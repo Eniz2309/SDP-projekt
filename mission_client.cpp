@@ -1,7 +1,10 @@
-// mission_client.cpp
-// Operator/test CLI.
-// v11: SUBMIT, STOP, PARAMS i rucni RTB.
-// v12: operator<->regionalni kanal je PQC TLS 1.3.\n
+// ============================================================
+// AUTONOMNI DRONOVI - VERZIJA 13
+// Fajl: mission_client.cpp
+// Dodano: zadrzan operator CLI preko PQC TLS kanala i uskladjen
+//         sa centralizovanom autentifikacijom ostatka sistema.
+// ============================================================
+
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <iostream>
