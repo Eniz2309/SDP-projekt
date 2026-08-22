@@ -8,6 +8,7 @@
 // Watchdog, UDP telemetrija/keepalive, INSPECTION i RTB ostaju podrzani.
 // v12_pqc_tls: svi TCP kanali koriste TLS 1.3 + X25519MLKEM768 + ML-DSA-44.
 // UDP TELEMETRY/KEEPALIVE koristi AES-256-GCM sa ključem izvedenim iz PQC TLS sesije.
+// v13_auth: REGISTER i AUTH se provjeravaju na centralnom credential registru.
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -725,38 +726,90 @@ json handle_drone_message(json msg)
 
     if (type == "REGISTER_REQ")
     {
-        std::string drone_uri = msg.value("DRONE_URI", "UNKNOWN_DRONE");
+        const std::string drone_uri = msg.value("DRONE_URI", "");
+        const std::string token = msg.value("TOKEN", "");
+        const std::string session_drone_uri =
+            msg.value("_SESSION_DRONE_URI", "");
 
-        json status_msg;
-        status_msg["TYPE"] = "DRONE_STATUS";
-        status_msg["DRONE_URI"] = drone_uri;
-        status_msg["BATTERY"] = msg.value("BATTERY", -1);
-        status_msg["STATUS"] = "REGISTERED";
-        status_msg["LAT"] = msg.value("LAT", 0.0);
-        status_msg["LON"] = msg.value("LON", 0.0);
-        status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
-        status_msg["ROUTE_ID"] = "";
-
-        save_drone_status(status_msg);
-        send_to_central(status_msg);
-
-        response["TYPE"] = "REGISTER_ACK";
-        response["DRONE_URI"] = drone_uri;
-        response["MESSAGE"] = "Drone registered on regional server";
-    }
-    else if (type == "AUTH_REQ")
-    {
-        std::string token = msg.value("TOKEN", "");
-
-        if (!token.empty())
+        if (!session_drone_uri.empty() && session_drone_uri != drone_uri)
         {
-            response["TYPE"] = "AUTH_ACK";
-            response["MESSAGE"] = "Authentication successful";
+            response["TYPE"] = "REGISTER_ERROR";
+            response["DRONE_URI"] = drone_uri;
+            response["MESSAGE"] = "TLS session already bound to another drone URI";
+            response["REASON"] = "SESSION_ALREADY_BOUND";
+            return response;
+        }
+
+        json register_msg;
+        register_msg["TYPE"] = "DRONE_REGISTER";
+        register_msg["DRONE_URI"] = drone_uri;
+        register_msg["TOKEN"] = token;
+
+        json central_response = send_to_central(register_msg);
+
+        if (central_response.value("TYPE", "") == "DRONE_REGISTER_OK")
+        {
+            json status_msg;
+            status_msg["TYPE"] = "DRONE_STATUS";
+            status_msg["DRONE_URI"] = drone_uri;
+            status_msg["BATTERY"] = msg.value("BATTERY", -1);
+            status_msg["STATUS"] = "REGISTERED";
+            status_msg["LAT"] = msg.value("LAT", 0.0);
+            status_msg["LON"] = msg.value("LON", 0.0);
+            status_msg["ALTITUDE"] = msg.value("ALTITUDE", 0);
+            status_msg["ROUTE_ID"] = "";
+
+            save_drone_status(status_msg);
+            send_to_central(status_msg);
+
+            response["TYPE"] = "REGISTER_ACK";
+            response["DRONE_URI"] = drone_uri;
+            response["MESSAGE"] = "Drone URI/token accepted by central registry";
         }
         else
         {
+            response["TYPE"] = "REGISTER_ERROR";
+            response["DRONE_URI"] = drone_uri;
+            response["MESSAGE"] = "Registration rejected by central registry";
+            response["REASON"] = central_response.value("REASON", "UNKNOWN_REASON");
+        }
+    }
+    else if (type == "AUTH_REQ")
+    {
+        const std::string drone_uri = msg.value("DRONE_URI", "");
+        const std::string token = msg.value("TOKEN", "");
+        const std::string session_drone_uri =
+            msg.value("_SESSION_DRONE_URI", "");
+
+        if (session_drone_uri.empty() || session_drone_uri != drone_uri)
+        {
             response["TYPE"] = "AUTH_ERROR";
-            response["MESSAGE"] = "Invalid token";
+            response["DRONE_URI"] = drone_uri;
+            response["MESSAGE"] = "Authentication rejected";
+            response["REASON"] = "SESSION_URI_MISMATCH";
+        }
+        else
+        {
+            json auth_msg;
+            auth_msg["TYPE"] = "DRONE_AUTH";
+            auth_msg["DRONE_URI"] = drone_uri;
+            auth_msg["TOKEN"] = token;
+
+            json central_response = send_to_central(auth_msg);
+
+            if (central_response.value("TYPE", "") == "DRONE_AUTH_OK")
+            {
+                response["TYPE"] = "AUTH_ACK";
+                response["DRONE_URI"] = drone_uri;
+                response["MESSAGE"] = "Authentication successful";
+            }
+            else
+            {
+                response["TYPE"] = "AUTH_ERROR";
+                response["DRONE_URI"] = drone_uri;
+                response["MESSAGE"] = "Authentication rejected by central registry";
+                response["REASON"] = central_response.value("REASON", "UNKNOWN_REASON");
+            }
         }
     }
     else if (type == "KEEPALIVE" || type == "TELEMETRY")
@@ -1022,6 +1075,7 @@ json handle_drone_message(json msg)
 void drone_session(const std::shared_ptr<DroneConnection>& connection)
 {
     std::string registered_drone_uri;
+    bool authenticated = false;
 
     try
     {
@@ -1052,14 +1106,41 @@ void drone_session(const std::shared_ptr<DroneConnection>& connection)
 
             json msg = json::parse(line);
 
-            if (msg.value("TYPE", "") == "REGISTER_REQ")
+            // Server-side binding: klijent ne moze AUTH_REQ-om promijeniti URI
+            // nakon sto je ova TLS sesija uspjesno registrovana.
+            msg["_SESSION_DRONE_URI"] = registered_drone_uri;
+
+            const std::string type = msg.value("TYPE", "");
+            const bool requires_drone_auth =
+                (type == "KEEPALIVE" || type == "TELEMETRY" ||
+                 type == "ALARM" || type == "DRONE_READY" ||
+                 type == "INSPECTION_REPORT" || type == "MISSION_FINISHED" ||
+                 type == "ACK_STOP" || type == "ACK_PARAMS" ||
+                 type == "ACK_RTB");
+
+            json response;
+            if (requires_drone_auth && !authenticated)
             {
-                registered_drone_uri =
-                    msg.value("DRONE_URI", "UNKNOWN_DRONE");
-                register_drone_connection(registered_drone_uri, connection);
+                response["TYPE"] = "AUTH_REQUIRED";
+                response["REASON"] = "DRONE_SESSION_NOT_AUTHENTICATED";
+            }
+            else
+            {
+                response = handle_drone_message(msg);
             }
 
-            json response = handle_drone_message(msg);
+            if (msg.value("TYPE", "") == "REGISTER_REQ" &&
+                response.value("TYPE", "") == "REGISTER_ACK")
+            {
+                registered_drone_uri = msg.value("DRONE_URI", "");
+            }
+
+            if (msg.value("TYPE", "") == "AUTH_REQ" &&
+                response.value("TYPE", "") == "AUTH_ACK")
+            {
+                authenticated = true;
+                register_drone_connection(registered_drone_uri, connection);
+            }
 
             std::string out = response.dump() + "\n";
             {
