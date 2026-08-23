@@ -365,3 +365,157 @@ Ako se isti validni datagram ponovi, regionalni ga ne prosljedjuje centralnom:
 ```text
 [REGIONAL][UDP][ANTI-REPLAY] Odbijen DRON_001 SEQ=15 last=15
 ```
+
+
+# Instalacija OpenSSL 3.5.7 sa PQC podrškom
+
+Projekt koristi OpenSSL 3.5.7 zbog podrške za post-kvantne algoritme kao što su:
+
+- ML-DSA-44
+- ML-KEM
+- X25519MLKEM768
+
+Sistemski OpenSSL na Ubuntu 22.04 se ne uklanja. Nova verzija se instalira odvojeno u:
+
+/usr/local/openssl
+
+## 1. Instalacija potrebnih paketa
+
+sudo apt update
+sudo apt install -y \
+build-essential \
+gcc \
+g++ \
+make \
+perl \
+wget \
+ca-certificates
+
+## 2. Preuzimanje OpenSSL 3.5.7
+
+cd /tmp
+wget https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz
+
+Raspakovati arhivu:
+
+tar -xzf openssl-3.5.7.tar.gz
+
+Ući u direktorij:
+
+cd openssl-3.5.7
+
+## 3. Konfiguracija
+
+./Configure \
+--prefix=/usr/local/openssl \
+--openssldir=/usr/local/openssl/ssl \
+shared
+
+## 4. Kompajliranje
+
+make -j"$(nproc)"
+
+## 5. Instalacija
+
+sudo make install_sw
+
+## 6. Dodavanje openssl.cnf
+
+Nakon make install_sw konfiguracioni fajl može nedostajati u /usr/local/openssl/ssl.
+
+Kreirati direktorij:
+
+sudo mkdir -p /usr/local/openssl/ssl
+
+Kopirati konfiguracioni fajl:
+
+sudo cp /tmp/openssl-3.5.7/apps/openssl.cnf \
+/usr/local/openssl/ssl/openssl.cnf
+
+Provjera:
+
+ls -l /usr/local/openssl/ssl/openssl.cnf
+
+## 7. Podešavanje okruženja
+
+Za trenutni terminal:
+
+export PATH=/usr/local/openssl/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/openssl/lib64:/usr/local/openssl/lib:${LD_LIBRARY_PATH:-}
+
+Provjeriti koji OpenSSL se koristi:
+
+which openssl
+
+Očekivano:
+
+/usr/local/openssl/bin/openssl
+
+Provjeriti verziju:
+
+openssl version
+
+Očekivano:
+
+OpenSSL 3.5.7 ...
+
+## 8. Trajno podešavanje
+
+Da nije potrebno izvršavati export komande nakon svakog otvaranja terminala, dodati ih u ~/.bashrc:
+
+echo 'export PATH=/usr/local/openssl/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/openssl/lib64:/usr/local/openssl/lib:${LD_LIBRARY_PATH:-}' >> ~/.bashrc
+
+Učitati novu konfiguraciju:
+
+source ~/.bashrc
+
+## 9. Provjera instalacije
+
+Detaljna provjera verzije:
+
+openssl version -a
+
+Provjera konfiguracionog direktorija:
+
+openssl version -d
+
+Očekivano:
+
+OPENSSLDIR: "/usr/local/openssl/ssl"
+
+Provjera biblioteka koje koristi novi OpenSSL:
+
+ldd /usr/local/openssl/bin/openssl | grep -E 'ssl|crypto'
+
+Biblioteke trebaju dolaziti iz:
+
+/usr/local/openssl/lib64/
+
+ili:
+
+/usr/local/openssl/lib/
+
+## 10. Provjera PQC algoritama
+
+Provjera ML-DSA:
+
+openssl list -signature-algorithms | grep -i ML-DSA
+
+Trebao bi biti dostupan najmanje:
+
+ML-DSA-44
+
+Provjera ML-KEM:
+
+openssl list -kem-algorithms | grep -i ML-KEM
+
+Provjera TLS grupa:
+
+openssl list -tls-groups | grep -Ei 'MLKEM|X25519MLKEM'
+
+Za projekt se koristi:
+
+X25519MLKEM768
+
+Ako su dostupni ML-DSA-44, ML-KEM i X25519MLKEM768, OpenSSL instalacija je spremna za korištenje u projektu.
